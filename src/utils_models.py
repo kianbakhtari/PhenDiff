@@ -35,7 +35,7 @@ def load_initial_pipeline(
     """
     logger.info("Loading initial pipeline...")
 
-    if args.pretrained_model_name_or_path is not None:
+    if args.pretrained_model_name_or_path is not None: # Kian: Mostly None in our case
         match args.model_type:
             case "StableDiffusion":
                 pipeline = _load_custom_SD(
@@ -53,7 +53,7 @@ def load_initial_pipeline(
                     "TODO: allow using SD without using a pretrained model"
                 )
             case "DDIM":
-                pipeline = _load_custom_DDIM_from_scratch(args, logger, accelerator)
+                pipeline = _load_custom_DDIM_from_scratch(args, logger, accelerator) # Kian: Our pipeline: ConditionalDDIMPipeline
 
     logger.info("Initial pipeline loaded")
 
@@ -163,9 +163,13 @@ def _load_custom_DDIM_from_scratch(
         args.denoiser_config_path,
     )
 
-    # override sample definition
+    # override sample definition and number of in and out channels
     denoiser_model_config["sample_size"] = args.definition
-
+    if args.denoiser_in_channels is not None:
+        denoiser_model_config["in_channels"] = int(args.denoiser_in_channels)
+    if args.denoiser_out_channels is not None:
+        denoiser_model_config["out_channels"] = int(args.denoiser_out_channels)
+    
     # Log the final denoiser config
     if accelerator.is_main_process:
         wandb_tracker = accelerator.get_tracker("wandb", unwrap=True)

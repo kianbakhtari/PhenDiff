@@ -73,7 +73,20 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--denoiser_config_path",
         type=str,
+        default=None,
         help="The path to the denoiser config. Must not be set if pretrained_model_name_or_path is set.",
+    )
+    parser.add_argument(
+        "--denoiser_in_channels",
+        type=int,
+        default=3,
+        help="Number of input channels",
+    )
+    parser.add_argument(
+        "--denoiser_out_channels",
+        type=int,
+        default="",
+        help="Number of output channels",
     )
     parser.add_argument(
         "--noise_scheduler_config_path",
@@ -99,17 +112,80 @@ def parse_args() -> Namespace:
             " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
         ),
     )
+
+    parser.add_argument(
+        "--fine_tune_with_paired_dataset_mode",
+        type=str,
+        help=(
+            "Paired training method: sample or translation"
+        ),
+    )
+    parser.add_argument(
+        "--paired_train_data_dir",
+        type=str,
+        default=None,
+        help=(
+            "A folder containing the paired training data. Folder contents must follow the structure described in"
+            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
+            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
+        ),
+    )
+    parser.add_argument(
+        "--test_data_dir",
+        type=str,
+        default=None,
+        help=(
+            "Test data dir"
+        ),
+    )
+    
+    parser.add_argument(
+        "--source_class_for_paired_training",
+        type=str,
+        default=None,
+        help=(
+            "A folder containing the images of the source class, when the translation task is one-way, like segmentation."
+        ),
+    )
+    parser.add_argument(
+        "--paired_training_loss",
+        type=str,
+        help=(
+            "Loss for paired training. mse or bce."
+        ),
+    )
+    
+    # parser.add_argument(
+    #     "--perform_translation_for_paired_training_every_epochs",
+    #     type=int,
+    #     default=0,
+    #     help=(
+    #         "Perform image translation (class transfer) on paired dataset for training every x epochs. Put 0 for disabling translation for paired training."
+    #     ),
+    # )
+    # parser.add_argument(
+    #     "--perform_sample_prediction_for_paired_training_every_epochs",
+    #     type=int,
+    #     default=0,
+    #     help=(
+    #         "Perform sample prediction from noisy-other-class on paired dataset for training every x epochs. Put 0 for disabling sample prediction for paired training."
+    #     ),
+    # )
+
     parser.add_argument(
         "--perc_samples",
         type=float,
         help="The percentage of samples (∈ ]0; 100]) to use from the training dataset *inside each class*.",
     )
+
     parser.add_argument(
         "--data_aug_on_the_fly",
         action="store_true",
         default=True,
         help="Whether to apply data augmentation in the data loader or not. Only a horizontal & vertical random flip is applied if True.",
     )
+    parser.add_argument("--no_data_aug_on_the_fly", action="store_false", dest="data_aug_on_the_fly", help="Disable data augmentation")
+
     parser.add_argument(
         "--compute_metrics_full_dataset",
         action="store_true",
@@ -171,6 +247,13 @@ def parse_args() -> Namespace:
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
+        "--paired_train_batch_size",
+        type=int,
+        required=True,
+        help="Batch size (per device) for the pairedtraining dataloader.",
+    )
+    
+    parser.add_argument(
         "--eval_batch_size",
         type=int,
         required=True,
@@ -227,6 +310,7 @@ def parse_args() -> Namespace:
         help="Whether to evaluate the model every epoch during the first n epochs. Ignored if None.",
     )
     parser.add_argument("--compute_fid", action="store_true", default=True)
+    parser.add_argument("--no_compute_fid", action="store_false", dest="compute_fid", help="Disable FID computation")
     parser.add_argument("--compute_isc", action="store_true", default=True)
     parser.add_argument("--compute_kid", action="store_true", default=False)
     help_msg = "How many images to generate (per class) for metrics computation. "
@@ -453,6 +537,13 @@ def parse_args() -> Namespace:
         help=(
             "Whether training should be resumed from a previous checkpoint. Use a path saved by"
             ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
+        ),
+    )
+    parser.add_argument(
+        "--fine_tune_experiment_by_paired_training",
+        type=str,
+        help=(
+            "Path to the last checkpoint of unpaired experiment"
         ),
     )
 

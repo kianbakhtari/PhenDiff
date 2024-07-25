@@ -290,16 +290,33 @@ def perform_class_transfer_experiment(args: ClassTransferExperimentParams):
     ```
     """
     for pipename, pipe in args.pipes.items():
-        # get the number of inference steps
+        '''
+        Kian.
+        pipe is:
+        ConditionalDDIMPipeline {
+            "_class_name": "ConditionalDDIMPipeline",
+            "_diffusers_version": "0.18.2",
+            "scheduler": [
+                "diffusers",
+                "DDIMScheduler"
+            ],
+            "unet": [
+                "src.cond_unet_2d.cond_unet_2d",
+                "CustomCondUNet2DModel"
+            ]
+        }
+        '''
+        # ----------- Get the number of inference steps ----------- #
         if args.num_inference_steps is None:
             num_inference_steps = args.cfg.pipeline[pipename].num_inference_steps
         else:
             num_inference_steps = args.num_inference_steps
 
+        # ----------- Creat data loader from dataset ----------- #
         for split, dataset in zip(
             ["train", "test"], [args.train_dataset, args.test_dataset]
         ):
-            # There might no be a test dataset
+            # There might not be a test dataset
             if dataset is None:
                 continue
 
@@ -312,12 +329,12 @@ def perform_class_transfer_experiment(args: ClassTransferExperimentParams):
                 shuffle=True,
             )
 
-            # Distributed inference & device placement
+            # ----------- Distributed inference & device placement ----------- #
             dataloader = args.accelerator.prepare(dataloader)
             pipe.unet = args.accelerator.prepare_model(pipe.unet, evaluation_mode=True)
             # pipe = pipe.to(args.accelerator.device)
 
-            # Create save dirs
+            # ----------- Creat save directories ----------- #
             save_dir = (
                 args.output_dir + f"/{args.class_transfer_method}/{pipename}/{split}"
             )
@@ -327,9 +344,10 @@ def perform_class_transfer_experiment(args: ClassTransferExperimentParams):
                 ]
                 for per_target_class_dir in per_target_class_dirs:
                     os.makedirs(per_target_class_dir)
+
             args.accelerator.wait_for_everyone()
 
-            # Iterate over batches
+            # ----------- Iterate Over Batches ----------- #
             for step, batch in enumerate(
                 tqdm(
                     dataloader,
@@ -338,8 +356,8 @@ def perform_class_transfer_experiment(args: ClassTransferExperimentParams):
                 )
             ):
                 # Get batch
-                clean_images = batch["images"].to(args.accelerator.device)
-                orig_class_labels = batch["class_labels"].to(args.accelerator.device)
+                clean_images = batch["images"].to(args.accelerator.device) # Kian: [bs, 3, 128, 128]
+                orig_class_labels = batch["class_labels"].to(args.accelerator.device) # Kian: tensor([1, 0, 1, 1, 0, 1, ...])
                 # only works for the binary case...
                 target_class_labels = 1 - orig_class_labels
                 filenames = batch["file_basenames"]
@@ -590,6 +608,7 @@ def _ddib(
     # Perform generation
     if isinstance(pipe, ConditionalDDIMPipeline):
         images_to_save = pipe(
+            for_testing=True,
             class_labels=target_class_labels,
             w=0,
             num_inference_steps=num_inference_steps,
@@ -608,6 +627,42 @@ def _ddib(
         )
     else:
         raise NotImplementedError
+
+    return images_to_save
+
+
+def _ddib_for_training(
+    pipe,
+    clean_images: Tensor,
+    orig_class_labels: Tensor,
+    target_class_labels: Tensor,
+    num_inference_steps: int,
+    process_idx: int,
+):
+    """TODO: docstring"""
+    # Preprocess inputs if LDM
+    # target_class_labels must be saved for filename
+
+    orig_class_cond = orig_class_labels
+
+    # Perform inversion
+    inverted_gauss = _inversion_for_training(
+        pipe, clean_images, orig_class_cond, num_inference_steps, process_idx
+    )
+
+    # Perform generation
+    if not isinstance(pipe, ConditionalDDIMPipeline):
+        raise NotImplementedError
+    
+    images_to_save = pipe(
+        for_testing=False,
+        class_labels=target_class_labels,
+        w=0,
+        num_inference_steps=num_inference_steps,
+        start_image=inverted_gauss,
+        add_forward_noise_to_image=False,
+        frac_diffusion_skipped=0,
+    )
 
     return images_to_save
 
@@ -798,6 +853,47 @@ def _inversion(
         ).prev_sample  # type: ignore
 
     return gauss
+
+
+def _inversion_for_training(
+    pipe: ConditionalDDIMPipeline | CustomStableDiffusionImg2ImgPipeline,
+    input_images: Tensor,
+    class_labels: Tensor,
+    num_inference_steps: int,
+    proc_idx: int | None,
+) -> Tensor:
+    """TODO: docstring"""
+    # duplicate the input images
+    # gauss = input_images.clone().detach()
+    gauss = input_images
+
+    # setup the inverted DDIM scheduler
+    DDIM_inv_scheduler: DDIMInverseScheduler = DDIMInverseScheduler.from_config(  # type: ignore
+        pipe.scheduler.config,
+    )
+    DDIM_inv_scheduler.set_timesteps(num_inference_steps)
+
+    # invert the diffeq
+    for t in tqdm(
+        DDIM_inv_scheduler.timesteps,
+        position=proc_idx + 1 if proc_idx is not None else 0,
+        desc=(
+            "Inverting images" + f" on process {proc_idx}"
+            if proc_idx is not None
+            else ""
+        ),
+        leave=False,
+    ):
+        model_output = pipe.unet(gauss, t, class_labels).sample
+
+        gauss = DDIM_inv_scheduler.step(
+            model_output,
+            t,  # type: ignore
+            gauss,  # type: ignore
+        ).prev_sample  # type: ignore
+
+    return gauss
+
 
 
 @torch.no_grad()

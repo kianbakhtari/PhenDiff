@@ -102,8 +102,8 @@ class CustomCondUNet2DModel(ModelMixin, ConfigMixin):
         norm_eps: float = 1e-5,
         resnet_time_scale_shift: str = "default",
         add_attention: bool = True,
-        class_embed_type: Optional[str] = None,
-        num_class_embeds: Optional[int] = None,
+        class_embed_type: Optional[str] = None, # None
+        num_class_embeds: Optional[int] = None, # 2
     ):
         super().__init__()
 

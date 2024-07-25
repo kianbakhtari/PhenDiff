@@ -283,6 +283,50 @@ def create_repo_structure(
     )
 
 
+def get_chckpt_save_path(
+    args: Namespace, accelerator, logger: MultiProcessAdapter
+) -> Path:
+    """
+    The repo structure is as follows:
+    ```
+    exp_output_dirs_parent_folder
+    |   <experiment_name>
+    |   |   <run_name>
+    |   |   |   checkpoints
+    |   |   |   |   step_<x>
+    |   |   |   |   step_<y>
+    |   |   |   full_pipeline_save
+    |   |   |   .tmp_image_generation_folder
+    |   .fidelity_cache
+    |   .initial_pipeline_save
+    |   .torch_hub_cache
+    ```
+    The <experiment_name>/<run_name> structure mimics that of Weight&Biases.
+    Any weights are specific to a run; any run belongs to a single experiment.
+    """
+    repo = None
+    this_experiment_folder = Path(
+        args.exp_output_dirs_parent_folder, args.experiment_name
+    )
+    this_run_folder = Path(this_experiment_folder, args.run_name)
+
+    if accelerator.is_main_process:
+        os.makedirs(this_run_folder, exist_ok=True)
+
+    full_pipeline_save_folder = Path(this_run_folder, "full_pipeline_save")
+    if accelerator.is_main_process:
+        os.makedirs(full_pipeline_save_folder, exist_ok=True)
+
+    initial_pipeline_save_folder = Path(
+        args.exp_output_dirs_parent_folder, ".initial_pipeline_save"
+    )
+    if accelerator.is_main_process:
+        os.makedirs(initial_pipeline_save_folder, exist_ok=True)
+
+    chckpt_save_path = Path(this_run_folder, "checkpoints")
+    return chckpt_save_path
+
+
 def setup_logger(logger: MultiProcessAdapter, accelerator) -> None:
     # set default logging format
     logging.basicConfig(

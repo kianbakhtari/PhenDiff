@@ -25,10 +25,11 @@ from diffusers.training_utils import EMAModel
 
 import wandb
 from src.args_parser import parse_args
-from src.utils_dataset import setup_dataset
+from src.utils_dataset import setup_dataset, setup_paired_dataset
 from src.utils_misc import (
     args_checker,
     create_repo_structure,
+    get_chckpt_save_path,
     get_HF_component_names,
     get_initial_best_metric,
     modify_args_for_debug,
@@ -41,7 +42,12 @@ from src.utils_training import (
     perform_training_epoch,
     resume_from_checkpoint,
     save_pipeline,
+    perform_class_transfer_for_paired_training,
+    perform_sample_prediction_for_paired_training,
+    setup_fine_tuning,
+    evaluate_with_test_dataset
 )
+from src.utils_Img2Img import ClassTransferExperimentParams
 
 logger: MultiProcessAdapter = get_logger(__name__, log_level="INFO")
 
@@ -72,6 +78,13 @@ def main(args: Namespace):
         project_config=accelerator_project_config,
         kwargs_handlers=kwargs_handlers,  # type: ignore
     )
+
+    # ----------------------------- Setup pre-trained model -----------------------------
+    # Setup pre-trained model if fine-tuning with paired dataset
+    if accelerator.is_main_process and args.fine_tune_experiment_by_paired_training:
+        chckpt_save_path = get_chckpt_save_path(args, accelerator, logger)
+        setup_fine_tuning(args, chckpt_save_path, logger)
+    accelerator.wait_for_everyone()
 
     # ----------------------------- Repository Structure -----------------------------
     (
@@ -157,6 +170,7 @@ def main(args: Namespace):
         if args.dataloader_num_workers is not None
         else accelerator.num_processes
     )
+
     train_dataloader = torch.utils.data.DataLoader(  # type: ignore
         dataset,
         batch_size=args.train_batch_size,
@@ -166,6 +180,34 @@ def main(args: Namespace):
         persistent_workers=args.persistent_workers,
         pin_memory=args.pin_memory
     )
+
+    if args.paired_train_data_dir is not None:
+        paired_dataset = setup_paired_dataset(args, logger)
+        paired_dataloader = torch.utils.data.DataLoader(  # type: ignore
+            paired_dataset,
+            batch_size=args.paired_train_batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            prefetch_factor=args.dataloader_prefetch_factor,
+            persistent_workers=args.persistent_workers,
+            pin_memory=args.pin_memory
+        )
+    else:
+        paired_dataloader = None
+
+    if args.test_data_dir is not None:
+        test_dataset = setup_paired_dataset(args, logger, test_split=True)
+        test_dataloader = torch.utils.data.DataLoader(  # type: ignore
+            test_dataset,
+            batch_size=args.paired_train_batch_size * 2,
+            shuffle=False,
+            num_workers=num_workers,
+            prefetch_factor=args.dataloader_prefetch_factor,
+            persistent_workers=args.persistent_workers,
+            pin_memory=args.pin_memory
+        )
+    else:
+        test_dataloader = None
 
     # ------------------------------------ Debug -------------------------------------
     if args.debug:
@@ -179,7 +221,7 @@ def main(args: Namespace):
     # here they are only used as convenient "supermodel" wrappers
     pipeline = load_initial_pipeline(
         args, initial_pipeline_save_folder, logger, nb_classes, accelerator
-    )
+    ) # Kian: ConditionalDDIMPipeline
 
     # --------------------------- Move & Freeze Components ---------------------------
     # Move components to device
@@ -365,38 +407,128 @@ def main(args: Namespace):
         best_metric = get_initial_best_metric()
 
     # --------------------------------- Training loop --------------------------------
+    if not args.fine_tune_with_paired_dataset_mode:
+        logger.info("Training with unpaired dataset...")
+    elif args.fine_tune_with_paired_dataset_mode == "sample":
+        logger.info("Training with paired dataset, sample prediction...")
+    elif args.fine_tune_with_paired_dataset_mode == "translation":
+        logger.info("Training with paired dataset, translation...")
+    else:
+        raise ValueError(f"args.fine_tune_with_paired_dataset_mode should be either sample or translation,\
+                not {args.fine_tune_with_paired_dataset_mode}")
+    
     while (
         epoch < (args.max_num_epochs if args.max_num_epochs is not None else inf)
         and global_step < tot_training_steps
     ):
-        # Training epoch
-        global_step, best_metric = perform_training_epoch(
+        if not args.fine_tune_with_paired_dataset_mode:
+
+            global_step, best_metric = perform_training_epoch(
+                num_update_steps_per_epoch=num_update_steps_per_epoch,
+                accelerator=accelerator,
+                pipeline=pipeline,
+                ema_models=ema_models,
+                components_to_train_transcribed=components_to_train_transcribed,
+                epoch=epoch,
+                train_dataloader=train_dataloader,
+                args=args,
+                first_epoch=first_epoch,
+                resume_step=resume_step,
+                global_step=global_step,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                logger=logger,
+                params_to_clip=params_to_optimize,
+                tot_training_steps=tot_training_steps,
+                image_generation_tmp_save_folder=image_generation_tmp_save_folder,
+                fidelity_cache_root=fidelity_cache_root,
+                actual_eval_batch_sizes_for_this_process=actual_eval_batch_sizes_for_this_process,
+                nb_classes=nb_classes,
+                dataset=dataset,
+                raw_dataset=raw_dataset,
+                full_pipeline_save_folder=full_pipeline_save_folder,
+                repo=repo,
+                best_metric=best_metric if accelerator.is_main_process else None,  # type: ignore
+                chckpt_save_path=chckpt_save_path,
+                paired_dataloader=paired_dataloader
+            )
+
+        elif args.fine_tune_with_paired_dataset_mode == "sample":
+
+            global_step, best_metric, loss_value = perform_sample_prediction_for_paired_training(
+                    num_update_steps_per_epoch=num_update_steps_per_epoch,
+                    accelerator=accelerator,
+                    pipeline=pipeline,
+                    ema_models=ema_models,
+                    components_to_train_transcribed=components_to_train_transcribed,
+                    epoch=epoch,
+                    dataloader=paired_dataloader,
+                    args=args,
+                    first_epoch=first_epoch,
+                    resume_step=resume_step,
+                    global_step=global_step,
+                    optimizer=optimizer,
+                    lr_scheduler=lr_scheduler,
+                    logger=logger,
+                    params_to_clip=params_to_optimize,
+                    tot_training_steps=tot_training_steps,
+                    image_generation_tmp_save_folder=image_generation_tmp_save_folder,
+                    fidelity_cache_root=fidelity_cache_root,
+                    actual_eval_batch_sizes_for_this_process=actual_eval_batch_sizes_for_this_process,
+                    nb_classes=nb_classes,
+                    dataset=dataset,
+                    raw_dataset=raw_dataset,
+                    full_pipeline_save_folder=full_pipeline_save_folder,
+                    repo=repo,
+                    best_metric=best_metric if accelerator.is_main_process else None,  # type: ignore
+                    chckpt_save_path=chckpt_save_path,
+                )
+
+        elif args.fine_tune_with_paired_dataset_mode == "translation":
+            
+            paired_training_additional_args = {"accelerator": accelerator}
+            for key, value in paired_training_additional_args.items():
+                setattr(args, key, value)
+                
+            global_step, best_metric, loss_value = perform_class_transfer_for_paired_training(
+                num_update_steps_per_epoch=num_update_steps_per_epoch,
+                accelerator=accelerator,
+                pipeline=pipeline,
+                ema_models=ema_models,
+                components_to_train_transcribed=components_to_train_transcribed,
+                epoch=epoch,
+                dataloader=paired_dataloader,
+                args=args,
+                first_epoch=first_epoch,
+                resume_step=resume_step,
+                global_step=global_step,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                logger=logger,
+                params_to_clip=params_to_optimize,
+                tot_training_steps=tot_training_steps,
+                image_generation_tmp_save_folder=image_generation_tmp_save_folder,
+                fidelity_cache_root=fidelity_cache_root,
+                actual_eval_batch_sizes_for_this_process=actual_eval_batch_sizes_for_this_process,
+                nb_classes=nb_classes,
+                full_pipeline_save_folder=full_pipeline_save_folder,
+                repo=repo,
+                best_metric=best_metric if accelerator.is_main_process else None,  # type: ignore
+                chckpt_save_path=chckpt_save_path,
+                dataset=dataset,
+                raw_dataset=raw_dataset
+            )
+        
+        metrics = evaluate_with_test_dataset(
             num_update_steps_per_epoch=num_update_steps_per_epoch,
             accelerator=accelerator,
             pipeline=pipeline,
-            ema_models=ema_models,
-            components_to_train_transcribed=components_to_train_transcribed,
             epoch=epoch,
-            train_dataloader=train_dataloader,
+            dataloader=test_dataloader,
             args=args,
-            first_epoch=first_epoch,
-            resume_step=resume_step,
             global_step=global_step,
-            optimizer=optimizer,
             lr_scheduler=lr_scheduler,
-            logger=logger,
-            params_to_clip=params_to_optimize,
-            tot_training_steps=tot_training_steps,
-            image_generation_tmp_save_folder=image_generation_tmp_save_folder,
-            fidelity_cache_root=fidelity_cache_root,
-            actual_eval_batch_sizes_for_this_process=actual_eval_batch_sizes_for_this_process,
-            nb_classes=nb_classes,
-            dataset=dataset,
-            raw_dataset=raw_dataset,
-            full_pipeline_save_folder=full_pipeline_save_folder,
-            repo=repo,
-            best_metric=best_metric if accelerator.is_main_process else None,  # type: ignore
-            chckpt_save_path=chckpt_save_path,
+            logger=logger
         )
 
         # Generate sample images for visual inspection & metrics computation

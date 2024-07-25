@@ -1,0 +1,56 @@
+############################################# DEFAULTS ############################################
+defaults:
+- class_transfer_method:
+  - ddib
+- dataset: translocation_5000
+- pipeline:
+  - DDIM
+- batch_size: v100-32gb.yaml
+- _self_
+
+####################################### EXPERIMENT VARIABLES ######################################
+exp_parent_folder: ./experiments
+path_to_script_parent_folder: /projects/deepdevpath/Anis/diffusion-comparison-experiments
+entity: imgimg-diffusion
+project: class_transfer
+run_name: translocation
+
+############################################## HYDRA ##############################################
+hydra:
+  run:
+    dir: ${exp_parent_folder}/${project}/${run_name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+############################################## SLURM ##############################################
+slurm:
+  enabled: false
+  monitor: false
+  signal_time: 300
+  email: email@company.com
+  output_folder: ${hydra:run.dir}
+  num_gpus: 3
+
+############################################## SWEEP ##############################################
+sweep_metric: null # TODO: retrieve from sweep cfg
+
+############################################ ACCELERATE ###########################################
+accelerate:
+  launch_args:
+    machine_rank: 0
+    num_machines: 1
+    gpu_ids: 0,1,2
+    rdzv_backend: static
+    same_network: true
+    mixed_precision: fp16
+    num_processes: 3
+    dynamo_backend: "no"
+    multi_gpu: true
+  offline: false
+
+############################################# METRICS #############################################
+compute_fid: true
+compute_isc: true
+compute_kid: true
+kid_subset_size: 1000 # 1000 is the default in torch-fidelity
+
+########################################## MISCELLANEOUS ##########################################
+debug: false
