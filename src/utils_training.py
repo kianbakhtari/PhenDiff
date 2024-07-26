@@ -53,8 +53,8 @@ from .utils_misc import (
 )
 from .utils_models import SupportedPipelines
 from .utils_Img2Img import (
-    _ddib,
-    _ddib_for_training
+    _ddib_for_training,
+    _ddibـfor_testing_during_training
 )
 
 
@@ -375,6 +375,66 @@ def perform_training_epoch(
     return global_step, best_metric
 
 
+def paired_train_and_test_evaluation_and_log(
+        accelerator: Accelerator,
+        global_step: int,
+        source_images: torch.tensor,
+        target_images: torch.tensor,
+        translated_images: torch.tensor,
+        split: str
+):
+    def process(tensor: torch.tensor) -> np.ndarray:
+            return tensor.detach()[:10].permute(0, 2, 3, 1).cpu().numpy()
+
+    if accelerator.is_main_process:
+
+        source_images_processed_for_logging = process(source_images)
+        source_images_to_log = [
+            wandb.Image(
+                source_images_processed_for_logging[i],
+                caption=f"{split} - source image {i}",
+            )
+            for i in range(len(source_images_processed_for_logging))
+        ]
+
+        target_images_processed_for_logging = process(target_images)
+        target_images_to_log = [
+            wandb.Image(
+                target_images_processed_for_logging[i],
+                caption=f"{split} - target image {i}",
+            )
+            for i in range(len(target_images_processed_for_logging))
+        ]
+
+        translated_images_processed_for_logging = process(translated_images)
+        translated_images_to_log = [
+            wandb.Image(
+                translated_images_processed_for_logging[i],
+                caption=f"{split} - translated image {i}",
+            )
+            for i in range(len(translated_images_processed_for_logging))
+        ]
+        
+        data_to_log = [
+            [src, tar, trans] for src, tar, trans in zip(
+                source_images_to_log,
+                target_images_to_log,
+                translated_images_to_log
+            )
+        ]
+        table = wandb.Table(
+            ["source images", "target images", "translated images"],
+            data_to_log,
+        )
+
+        accelerator.log(
+            {
+                f"{split} data samples": table
+            },
+            step=global_step
+        )
+
+
 def perform_class_transfer_for_paired_training(
     num_update_steps_per_epoch: int,
     accelerator: Accelerator,
@@ -409,13 +469,12 @@ def perform_class_transfer_for_paired_training(
     denoiser_model.train()
     num_inference_steps = 30
     # ----------- Distributed inference & device placement ----------- #
-    dataloader = args.accelerator.prepare(dataloader)
-    # pipe = pipe.to(args.accelerator.device)
+    dataloader = accelerator.prepare(dataloader)
+    # pipe = pipe.to(accelerator.device)
 
     # ----------- Creat save directories ----------- #
-    args.accelerator.wait_for_everyone()
+    accelerator.wait_for_everyone()
 
-    # 2. Give me a pretty progress bar 🤩
     progress_bar = tqdm(
         total=num_update_steps_per_epoch,
         disable=not accelerator.is_local_main_process,
@@ -423,18 +482,21 @@ def perform_class_transfer_for_paired_training(
     progress_bar.set_description(f"Epoch {epoch}")
     
     # ----------- Iterate Over Batches ----------- #
+    sources_accu = []
+    targets_accu = []
+    translateds_accu = []
+
     for step, batch in enumerate(
         tqdm(
             dataloader,
-            desc=f"Running paired training, iterating over batches...",
+            desc=f"Running paired translation for training, iterating over batches...",
             position=0,
         )
-    ):
-        
-        source_images = batch["source_images"].to(args.accelerator.device)
-        source_labels = batch["source_class"].to(args.accelerator.device)
-        target_images = batch["target_images"].to(args.accelerator.device)
-        target_labels = batch["target_class"].to(args.accelerator.device)
+    ):  
+        source_images = batch["source_images"].to(accelerator.device)
+        source_labels = batch["source_class"].to(accelerator.device)
+        target_images = batch["target_images"].to(accelerator.device)
+        target_labels = batch["target_class"].to(accelerator.device)
 
         orig_class_labels = source_labels
         target_class_labels = 1 - orig_class_labels
@@ -442,19 +504,32 @@ def perform_class_transfer_for_paired_training(
 
         translated_images = _ddib_for_training(
             pipe,
-            source_images, # [bs, 1, 128, 128]
+            source_images, # [bs, ch, 128, 128]
             orig_class_labels, # [bs] --> [1, 1, 1, 1, 1, 1, ...]
             target_class_labels,
             num_inference_steps,
-            process_idx=args.accelerator.process_index
+            process_idx=accelerator.process_index
         )
+
+        if len(sources_accu) < 10:
+            sources_accu.append(source_images)
+            targets_accu.append(target_images)
+            translateds_accu.append(translated_images)
         
-        # print("\n\n==")
-        # print(translated_images.shape)
-        # print(target_images.shape)
-        # print(source_images.shape)
-        
-        translated_images = translated_images.permute(0, 3, 1, 2)
+        ##########
+        # def print_tensor_info(tensor, tensor_name):
+        #     print(f"{tensor_name}:")
+        #     print(f"  Shape: {tensor.shape}")
+        #     print(f"  Type: {tensor.dtype}")
+        #     print(f"  Min value: {tensor.min().item()}")
+        #     print(f"  Max value: {tensor.max().item()}")
+        #     print()
+
+        # if step % 10 == 0:
+        #     print_tensor_info(source_images, "source_images")
+        #     print_tensor_info(target_images, "target_images")
+        #     print_tensor_info(translated_images, "translated_images")
+        ##########
 
         mse_loss = F.mse_loss(translated_images, target_images)
         bce_loss = None # Default
@@ -485,7 +560,6 @@ def perform_class_transfer_for_paired_training(
                 chckpt_save_path=chckpt_save_path,
             )
 
-        # log some values & define W&B alert
         logs = {
             "train_bce": bce_loss,
             "train_mse": mse_loss,
@@ -510,36 +584,19 @@ def perform_class_transfer_for_paired_training(
             )
             logger.error(msg)
 
-        # Generate sample images for visual inspection & metrics computation
-        if (
-            args.eval_save_model_every_opti_steps is not None
-            and global_step % args.eval_save_model_every_opti_steps == 0
-        ):
-            best_metric = generate_samples_compute_metrics_save_pipe(
-                args,
-                accelerator,
-                pipeline,
-                image_generation_tmp_save_folder,
-                fidelity_cache_root,
-                actual_eval_batch_sizes_for_this_process,
-                epoch,
-                global_step,
-                ema_models,
-                components_to_train_transcribed,
-                nb_classes,
-                logger,
-                dataset,
-                raw_dataset,
-                best_metric,
-                full_pipeline_save_folder,
-                repo,
-            )
-
     progress_bar.close()
 
-    # wait for everybody at end of each training epoch
+    print("Epoch done, visual evaluation on train set...")
+    paired_train_and_test_evaluation_and_log(
+        accelerator=accelerator,
+        global_step=global_step,
+        source_images=torch.cat(sources_accu, dim=0),
+        target_images=torch.cat(targets_accu, dim=0),
+        translated_images=torch.cat(translateds_accu, dim=0),
+        split="train"
+    )
+    
     accelerator.wait_for_everyone()
-
     return global_step, best_metric, loss_value
 
 
@@ -888,8 +945,6 @@ def _diffusion_and_backward_for_paired_sample_prediction(
     optimizer.zero_grad()
 
     return loss.item()
-    
-    
 
 
 def _SD_prediction_wrapper(
@@ -1498,26 +1553,41 @@ def save_pipeline(
 
 
 def setup_fine_tuning(args, chckpt_save_path, logger):
-    checkpoint_dir_name = os.path.basename(args.fine_tune_experiment_by_paired_training)
-    if len(checkpoint_dir_name) <= 1:
-        logger.warning(
-            f"checkpoint_dir_name is too short ({checkpoint_dir_name}), probably because args.fine_tune_experiment_by_paired_training ends in /."
-        )
-        print(f"checkpoint_dir_name is too short ({checkpoint_dir_name}), probably because args.fine_tune_experiment_by_paired_training ends in /.")
+    # if not args.fine_tune_experiment_by_paired_training.endswith("/"):
+    #     raise Exception(f"args.fine_tune_experiment_by_paired_training should end in /.")
+    if not chckpt_save_path.endswith("/"):
+        chckpt_save_path += "/"
 
-    if not args.fine_tune_experiment_by_paired_training.endswith("/"):
-        raise Exception(f"args.fine_tune_experiment_by_paired_training should end with /.")
-        
+    if args.fine_tune_experiment_by_paired_training.endswith("/"):
+        checkpoint_dir_name = os.path.basename(args.fine_tune_experiment_by_paired_training[:-1])
+    else:
+        checkpoint_dir_name = os.path.basename(args.fine_tune_experiment_by_paired_training)
+    
+    # print("\n#####")
+    # print(args.fine_tune_experiment_by_paired_training)
+    # print(chckpt_save_path)
+    # print("#####\n")
+
+    if not os.path.isdir(chckpt_save_path):
+        raise Exception("os.path.isdir(chckpt_save_path) is false")
+    if not os.path.isdir(args.fine_tune_experiment_by_paired_training):
+        raise Exception("os.path.isdir(args.fine_tune_experiment_by_paired_training) is false")
+
     cmd = f"cp -r {args.fine_tune_experiment_by_paired_training} {chckpt_save_path}"
-    print(cmd)
+    
+    print("CMD:\n", cmd)
+
     exc_code = os.system(cmd)
     if exc_code != 0:
         raise Exception(f"exit code {exc_code} for command: {cmd}")
+
     logger.info(
         f"Pre-trained checkpoint coppied:\nFrom: {args.fine_tune_experiment_by_paired_training}\nTo: {chckpt_save_path}\n"
     )
     print(f"Pre-trained checkpoint coppied:\nFrom: {args.fine_tune_experiment_by_paired_training}\nTo: {chckpt_save_path}\n")
+
     args.resume_from_checkpoint = checkpoint_dir_name
+
     logger.info(
         f"args.resume_from_checkpoint is updated: {args.resume_from_checkpoint}"
     )
@@ -1565,13 +1635,12 @@ def evaluate_with_test_dataset(
     denoiser_model.eval()
     num_inference_steps = 30
     # ----------- Distributed inference & device placement ----------- #
-    dataloader = args.accelerator.prepare(dataloader)
-    # pipe = pipe.to(args.accelerator.device)
+    dataloader = accelerator.prepare(dataloader)
+    # pipe = pipe.to(accelerator.device)
 
     # ----------- Creat save directories ----------- #
-    args.accelerator.wait_for_everyone()
+    accelerator.wait_for_everyone()
 
-    # 2. Give me a pretty progress bar 🤩
     progress_bar = tqdm(
         total=num_update_steps_per_epoch,
         disable=not accelerator.is_local_main_process,
@@ -1580,45 +1649,51 @@ def evaluate_with_test_dataset(
     
     # ----------- Iterate Over Batches ----------- #
     mse_all, bce_all, dice_all = [], [], []
+    sources_accu = []
+    targets_accu = []
+    translateds_accu = []
     
     for step, batch in enumerate(
         tqdm(
             dataloader,
-            desc=f"Running paired training, iterating over batches...",
+            desc=f"Testing, iterating over batches...",
             position=0,
         )
     ):
         
-        source_images = batch["source_images"].to(args.accelerator.device)
-        source_labels = batch["source_class"].to(args.accelerator.device)
-        target_images = batch["target_images"].to(args.accelerator.device)
-        target_labels = batch["target_class"].to(args.accelerator.device)
+        source_images = batch["source_images"].to(accelerator.device)
+        source_labels = batch["source_class"].to(accelerator.device)
+        target_images = batch["target_images"].to(accelerator.device)
+        target_labels = batch["target_class"].to(accelerator.device)
 
         orig_class_labels = source_labels
         target_class_labels = 1 - orig_class_labels
         assert torch.equal(target_class_labels, target_labels), "target_class_labels and target_labels should be the same."
 
         with torch.no_grad():
-            translated_images = _ddib(
+            translated_images = _ddibـfor_testing_during_training(
                 pipe,
                 source_images, # [bs, 1, 128, 128]
                 orig_class_labels, # [bs] --> [1, 1, 1, 1, 1, 1, ...]
                 target_class_labels,
                 num_inference_steps,
-                process_idx=args.accelerator.process_index
+                process_idx=accelerator.process_index
             )
-            
-            translated_images = translated_images.permute(0, 3, 1, 2)
+
+            if len(sources_accu) < 20:
+                sources_accu.append(source_images)
+                targets_accu.append(target_images)
+                translateds_accu.append(translated_images)
             
             mse = F.mse_loss(translated_images, target_images)
-            mse_all.append(mse)
+            mse_all.append(mse.cpu().item())
 
             bce, dice = None, None
             if args.paired_training_loss == "bce":
                 bce = F.binary_cross_entropy(translated_images, target_images)
                 dice = dice_score(translated_images, target_images)
-                bce_all.append(bce)
-                dice_all.append(dice)
+                bce_all.append(bce.cpu().item())
+                dice_all.append(dice.cpu().item())
 
     test_logs = {
         "test_mse": np.array(mse_all).mean(),
@@ -1628,7 +1703,15 @@ def evaluate_with_test_dataset(
         "step": global_step,
         "epoch": epoch,
     }
-
     accelerator.log(test_logs, step=global_step)
     accelerator.wait_for_everyone()
+
+    paired_train_and_test_evaluation_and_log(
+        accelerator=accelerator,
+        global_step=global_step,
+        source_images=torch.cat(sources_accu, dim=0),
+        target_images=torch.cat(targets_accu, dim=0),
+        translated_images=torch.cat(translateds_accu, dim=0),
+        split="test"
+    )
     return test_logs

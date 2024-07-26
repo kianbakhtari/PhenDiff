@@ -485,10 +485,6 @@ def main(args: Namespace):
                 )
 
         elif args.fine_tune_with_paired_dataset_mode == "translation":
-            
-            paired_training_additional_args = {"accelerator": accelerator}
-            for key, value in paired_training_additional_args.items():
-                setattr(args, key, value)
                 
             global_step, best_metric, loss_value = perform_class_transfer_for_paired_training(
                 num_update_steps_per_epoch=num_update_steps_per_epoch,
@@ -519,6 +515,7 @@ def main(args: Namespace):
                 raw_dataset=raw_dataset
             )
         
+        print("Evaluation on test set...")
         metrics = evaluate_with_test_dataset(
             num_update_steps_per_epoch=num_update_steps_per_epoch,
             accelerator=accelerator,

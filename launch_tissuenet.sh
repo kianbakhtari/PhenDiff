@@ -8,7 +8,7 @@ echo -e "\n<--------------------------------------- launch_script_DDIM.sh ------
 # ------------------------------------------> Variables <------------------------------------------
 exp_name=FineTune-mock # experiment and output folder name; common to all runs in the same experiment
 
-run_name=TN_binary_from_PhenDiff_TN_cond_super_small_denoiser_config_25000-1 # wandb run display name
+run_name=TN_binary_from_PhenDiff_TN_cond_super_small_denoiser_config_25000-S2 # wandb run display name
 
 exp_dirs_parent_folder=./experiments
 model_configs_folder=./models_configs
@@ -31,7 +31,7 @@ ${acc_cfg}
 --rdzv_backend=static
 --same_network
 --dynamo_backend=no
---gpu_ids 2
+--gpu_ids 0
 --main_process_port=29501
 "
 # --main_process_port=29501
@@ -53,7 +53,7 @@ $1
 --train_batch_size 112
 
 --fine_tune_with_paired_dataset_mode translation
---fine_tune_experiment_by_paired_training /projects/deepdevpath2/Kian/PhenDiff/experiments/PhenDiff/PhenDiff_TN_cond_super_small_denoiser_config/checkpoints/step_25000/
+--fine_tune_experiment_by_paired_training /projects/deepdevpath2/Kian/PhenDiff/experiments/PhenDiff/PhenDiff_TN_cond_super_small_denoiser_config/checkpoints/step_25000
 
 --paired_train_data_dir /projects/deepdevpath2/Kian/datasets/TissueNet/TN-binary-paired/nuc/
 --test_data_dir /projects/deepdevpath2/Kian/datasets/TissueNet/TN-binary-test/nuc/train/

@@ -389,6 +389,8 @@ def perform_class_transfer_experiment(args: ClassTransferExperimentParams):
                             num_inference_steps,
                             process_idx=args.accelerator.process_index,
                         )
+                        # Kian: images_to_save had shape [bs, ch, H, W] in pipeline but permuted into [bs, H, W, ch] before being returned to here
+
                     case "inverted_regeneration":
                         # inverted regen is just DDIB with the original class as target!
                         target_class_labels = orig_class_labels
@@ -406,6 +408,7 @@ def perform_class_transfer_experiment(args: ClassTransferExperimentParams):
                         )
 
                 # Save images to disk
+                # Kian: images_to_save are saved and logged with [bs, H, W, ch]
                 if isinstance(images_to_save, Image.Image):
                     images_to_save = [images_to_save]
                 for i, image_to_save in enumerate(images_to_save):
@@ -422,7 +425,7 @@ def perform_class_transfer_experiment(args: ClassTransferExperimentParams):
                     # original samples
                     clean_images_processed_for_logging = (
                         clean_images.detach()[:MAX_NB_LOGGED_IMAGES]
-                        .permute(0, 2, 3, 1)
+                        .permute(0, 2, 3, 1) # Kian: moving ch to end: [bs, ch, H, W] -> [bs, H, W, ch]
                         .cpu()
                         .numpy()
                     )
@@ -436,7 +439,7 @@ def perform_class_transfer_experiment(args: ClassTransferExperimentParams):
                     # transferred samples
                     transferred_samples_to_log = [
                         wandb.Image(
-                            images_to_save[i],
+                            images_to_save[i], # Kian: shape is already [bs, H, W, ch]
                             caption=f"{filenames[i]}_to_{dataset.classes[target_class_labels[i]]}",  # type: ignore
                         )
                         for i in range(len(clean_images_processed_for_logging))
@@ -666,6 +669,46 @@ def _ddib_for_training(
 
     return images_to_save
 
+@torch.no_grad()
+def _ddibـfor_testing_during_training(
+    pipe,
+    clean_images: Tensor,
+    orig_class_labels: Tensor,
+    target_class_labels: Tensor,
+    num_inference_steps: int,
+    process_idx: int,
+):
+    """TODO: docstring"""
+    # Preprocess inputs if LDM
+    # target_class_labels must be saved for filename
+    if isinstance(pipe, CustomStableDiffusionImg2ImgPipeline):
+        clean_images, [orig_class_cond] = _LDM_preprocess(  # type: ignore
+            pipe, clean_images, [orig_class_labels]
+        )
+    else:
+        orig_class_cond = orig_class_labels
+
+    # Perform inversion
+    inverted_gauss = _inversion(
+        pipe, clean_images, orig_class_cond, num_inference_steps, process_idx
+    )
+
+    # Perform generation
+    if isinstance(pipe, ConditionalDDIMPipeline):
+        images_to_save = pipe(
+            for_testing=True,
+            class_labels=target_class_labels,
+            w=0,
+            num_inference_steps=num_inference_steps,
+            start_image=inverted_gauss,
+            add_forward_noise_to_image=False,
+            frac_diffusion_skipped=0,
+        )
+    else:
+        raise NotImplementedError
+
+    return images_to_save
+
 
 @torch.no_grad()
 def _classifier_free_guidance_forward_start(
@@ -834,16 +877,18 @@ def _inversion(
     DDIM_inv_scheduler.set_timesteps(num_inference_steps)
 
     # invert the diffeq
-    for t in tqdm(
-        DDIM_inv_scheduler.timesteps,
-        position=proc_idx + 1 if proc_idx is not None else 0,
-        desc=(
-            "Inverting images" + f" on process {proc_idx}"
-            if proc_idx is not None
-            else ""
-        ),
-        leave=False,
-    ):
+    # for t in tqdm(
+    #     DDIM_inv_scheduler.timesteps,
+    #     position=proc_idx + 1 if proc_idx is not None else 0,
+    #     desc=(
+    #         "Inverting images" + f" on process {proc_idx}"
+    #         if proc_idx is not None
+    #         else ""
+    #     ),
+    #     leave=False,
+    # ):
+
+    for t in DDIM_inv_scheduler.timesteps:
         model_output = pipe.unet(gauss, t, class_labels).sample
 
         gauss = DDIM_inv_scheduler.step(
@@ -874,16 +919,18 @@ def _inversion_for_training(
     DDIM_inv_scheduler.set_timesteps(num_inference_steps)
 
     # invert the diffeq
-    for t in tqdm(
-        DDIM_inv_scheduler.timesteps,
-        position=proc_idx + 1 if proc_idx is not None else 0,
-        desc=(
-            "Inverting images" + f" on process {proc_idx}"
-            if proc_idx is not None
-            else ""
-        ),
-        leave=False,
-    ):
+    # for t in tqdm(
+    #     DDIM_inv_scheduler.timesteps,
+    #     position=proc_idx + 1 if proc_idx is not None else 0,
+    #     desc=(
+    #         "Inverting images" + f" on process {proc_idx}"
+    #         if proc_idx is not None
+    #         else ""
+    #     ),
+    #     leave=False,
+    # ):
+    
+    for t in DDIM_inv_scheduler.timesteps:
         model_output = pipe.unet(gauss, t, class_labels).sample
 
         gauss = DDIM_inv_scheduler.step(

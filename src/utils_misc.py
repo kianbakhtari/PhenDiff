@@ -285,7 +285,7 @@ def create_repo_structure(
 
 def get_chckpt_save_path(
     args: Namespace, accelerator, logger: MultiProcessAdapter
-) -> Path:
+) -> str:
     """
     The repo structure is as follows:
     ```
@@ -324,7 +324,10 @@ def get_chckpt_save_path(
         os.makedirs(initial_pipeline_save_folder, exist_ok=True)
 
     chckpt_save_path = Path(this_run_folder, "checkpoints")
-    return chckpt_save_path
+    if accelerator.is_main_process:
+        os.makedirs(chckpt_save_path, exist_ok=True)
+        
+    return os.path.join("/projects/deepdevpath2/Kian/PhenDiff/", chckpt_save_path)
 
 
 def setup_logger(logger: MultiProcessAdapter, accelerator) -> None:

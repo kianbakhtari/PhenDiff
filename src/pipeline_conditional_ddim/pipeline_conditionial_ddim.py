@@ -305,6 +305,7 @@ class ConditionalDDIMPipeline(DiffusionPipeline):
             ).prev_sample
 
         image = (image / 2 + 0.5).clamp(0, 1)
+        # Kian: Moivng ch to end probably for PIL
         image = image.cpu().permute(0, 2, 3, 1).numpy()
         if output_type == "pil":
             image = self.numpy_to_pil(image)
@@ -423,7 +424,8 @@ class ConditionalDDIMPipeline(DiffusionPipeline):
             )
         )
 
-        for t in self.progress_bar(timesteps):
+        # for t in self.progress_bar(timesteps):
+        for t in timesteps:
             # TODO: do the cond & uncond passes at once like for SD!
             # 1. predict noise model_output
             sig = signature(self.unet.module.forward)
@@ -486,8 +488,8 @@ class ConditionalDDIMPipeline(DiffusionPipeline):
                 generator=generator,
             ).prev_sample
 
-        image = (image / 2 + 0.5).clamp(0, 1)
-        image = image.permute(0, 2, 3, 1)
+        # image = (image / 2 + 0.5).clamp(0, 1)
+        # image = image.permute(0, 2, 3, 1) # [bs, ch, H, W] -> [bs, H, W, ch]
         return image
 
 
@@ -596,7 +598,9 @@ class ConditionalDDIMPipeline(DiffusionPipeline):
             )
         )
 
-        for t in self.progress_bar(timesteps):
+        # for t in self.progress_bar(timesteps):
+        for t in timesteps:
+            
             # TODO: do the cond & uncond passes at once like for SD!
             # 1. predict noise model_output
             sig = signature(self.unet.module.forward)
@@ -659,8 +663,8 @@ class ConditionalDDIMPipeline(DiffusionPipeline):
                 generator=generator,
             ).prev_sample
 
-        image = (image / 2 + 0.5).clamp(0, 1)
-        image = image.permute(0, 2, 3, 1)
+        # image = (image / 2 + 0.5).clamp(0, 1)
+        # image = image.permute(0, 2, 3, 1)
         return image
     
     
