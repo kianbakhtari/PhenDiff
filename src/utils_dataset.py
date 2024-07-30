@@ -19,7 +19,8 @@ from typing import Optional
 import os
 import glob
 from PIL import Image
-from typing import Literal, Optional, Tuple, Union, List, Dict
+from io import BytesIO
+from typing import Literal, Optional, Tuple, Union, List, Dict, Any
 
 import torch
 from accelerate.logging import MultiProcessAdapter
@@ -178,6 +179,33 @@ def setup_dataset(
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
+
+    #################################################
+    def pil_loader(path: str) -> Image.Image:
+    # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
+        with open(path, "rb") as f:
+            img = Image.open(BytesIO(f.read()))
+            return img
+
+    def accimage_loader(path: str) -> Any:
+        import accimage
+
+        try:
+            print("\n\nACCC\n\n")
+            return accimage.Image(path)
+        except OSError:
+            # Potentially a decoding problem, fall back to PIL.Image
+            return pil_loader(path)
+
+    def default_loader(path: str) -> Any:
+        from torchvision import get_image_backend
+
+        if get_image_backend() == "accimage":
+            return accimage_loader(path)
+        else:
+            return pil_loader(path)
+    #################################################
+
     if args.dataset_name is not None:
         raise NotImplementedError("Not tested yet")
         dataset = load_dataset(
@@ -191,10 +219,12 @@ def setup_dataset(
             root=Path(args.train_data_dir, args.split).as_posix(),
             transform=lambda x: transformations(x), ########################### Kian: I removed x.convert("RGB") in this line.
             target_transform=lambda y: torch.tensor(y).long(),
+            loader=default_loader,
         )
         raw_dataset: NoLabelsDataset | Subset = NoLabelsDataset(
             root=Path(args.train_data_dir, args.split).as_posix(),
             transform=lambda x: raw_transformations(x), ########################### Kian: I removed x.convert("RGB") in this line.
+            loader=default_loader,
         )
         assert len(dataset) == len(
             raw_dataset
@@ -250,10 +280,10 @@ def setup_dataset(
         ]
     )
 
-    # def transform_images(examples):
-    #     images = [transformations(image.convert("RGB")) for image in examples["image"]]
-    #     class_labels = examples["label"]
-    #     return {"images": images, "class_labels": class_labels}
+    def transform_images(examples):
+        images = [transformations(image.convert("RGB")) for image in examples["image"]]
+        class_labels = examples["label"]
+        return {"images": images, "class_labels": class_labels}
 
     if not args.use_pytorch_loader:
         raise NotImplementedError("Not tested yet")

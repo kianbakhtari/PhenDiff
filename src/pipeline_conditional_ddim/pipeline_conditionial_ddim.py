@@ -490,6 +490,7 @@ class ConditionalDDIMPipeline(DiffusionPipeline):
 
         # image = (image / 2 + 0.5).clamp(0, 1)
         # image = image.permute(0, 2, 3, 1) # [bs, ch, H, W] -> [bs, H, W, ch]
+        # return image.clamp(-1, 1)
         return image
 
 
@@ -665,7 +666,7 @@ class ConditionalDDIMPipeline(DiffusionPipeline):
 
         # image = (image / 2 + 0.5).clamp(0, 1)
         # image = image.permute(0, 2, 3, 1)
-        return image
+        return image.clamp(-1, 1)
     
     
     def __call__(
@@ -761,19 +762,19 @@ class ConditionalDDIMPipeline(DiffusionPipeline):
                 frac_diffusion_skipped=frac_diffusion_skipped,
                 guidance_eqn=guidance_eqn
             )
-        else:
-            return self._original_no_grad_call(
-                class_labels=class_labels,
-                class_emb=class_emb,
-                w=w,
-                generator=generator,
-                eta=eta,
-                num_inference_steps=num_inference_steps,
-                use_clipped_model_output=use_clipped_model_output,
-                output_type=output_type,
-                return_dict=return_dict,
-                start_image=start_image,
-                add_forward_noise_to_image=add_forward_noise_to_image,
-                frac_diffusion_skipped=frac_diffusion_skipped,
-                guidance_eqn=guidance_eqn
-            )
+
+        return self._original_no_grad_call(
+            class_labels=class_labels,
+            class_emb=class_emb,
+            w=w,
+            generator=generator,
+            eta=eta,
+            num_inference_steps=num_inference_steps,
+            use_clipped_model_output=use_clipped_model_output,
+            output_type=output_type,
+            return_dict=return_dict,
+            start_image=start_image,
+            add_forward_noise_to_image=add_forward_noise_to_image,
+            frac_diffusion_skipped=frac_diffusion_skipped,
+            guidance_eqn=guidance_eqn
+        )

@@ -45,7 +45,7 @@ from src.utils_training import (
     perform_class_transfer_for_paired_training,
     perform_sample_prediction_for_paired_training,
     setup_fine_tuning,
-    evaluate_with_test_dataset
+    evaluate_paired_dataset
 )
 from src.utils_Img2Img import ClassTransferExperimentParams
 
@@ -406,7 +406,7 @@ def main(args: Namespace):
     if accelerator.is_main_process:
         best_metric = get_initial_best_metric()
 
-    # --------------------------------- Training loop --------------------------------
+    # --------------------------------- Getting Ready For Training --------------------------------
     if not args.fine_tune_with_paired_dataset_mode:
         logger.info("Training with unpaired dataset...")
     elif args.fine_tune_with_paired_dataset_mode == "sample":
@@ -417,6 +417,38 @@ def main(args: Namespace):
         raise ValueError(f"args.fine_tune_with_paired_dataset_mode should be either sample or translation,\
                 not {args.fine_tune_with_paired_dataset_mode}")
     
+    # Initial evaluation on train and test datasets in case of paired training (fine tuning)
+    if args.fine_tune_with_paired_dataset_mode in ["sample", "translation"]:
+        # On train dataset
+        initial_train_metrics = evaluate_paired_dataset(
+                num_update_steps_per_epoch=num_update_steps_per_epoch,
+                accelerator=accelerator,
+                pipeline=pipeline,
+                epoch=epoch,
+                dataloader=paired_dataloader,
+                split="train",
+                args=args,
+                global_step=global_step,
+                lr_scheduler=lr_scheduler,
+                logger=logger,
+                is_initial_benchmark=True,
+            )
+        # On test dataset
+        initial_test_metrics = evaluate_paired_dataset(
+                num_update_steps_per_epoch=num_update_steps_per_epoch,
+                accelerator=accelerator,
+                pipeline=pipeline,
+                epoch=epoch,
+                dataloader=test_dataloader,
+                split="test",
+                args=args,
+                global_step=global_step,
+                lr_scheduler=lr_scheduler,
+                logger=logger,
+                is_initial_benchmark=True,
+            )
+
+    # --------------------------------- Training loop --------------------------------    
     while (
         epoch < (args.max_num_epochs if args.max_num_epochs is not None else inf)
         and global_step < tot_training_steps
@@ -511,49 +543,50 @@ def main(args: Namespace):
                 repo=repo,
                 best_metric=best_metric if accelerator.is_main_process else None,  # type: ignore
                 chckpt_save_path=chckpt_save_path,
-                dataset=dataset,
-                raw_dataset=raw_dataset
             )
-        
-        print("Evaluation on test set...")
-        metrics = evaluate_with_test_dataset(
-            num_update_steps_per_epoch=num_update_steps_per_epoch,
-            accelerator=accelerator,
-            pipeline=pipeline,
-            epoch=epoch,
-            dataloader=test_dataloader,
-            args=args,
-            global_step=global_step,
-            lr_scheduler=lr_scheduler,
-            logger=logger
-        )
 
+        if not args.fine_tune_with_paired_dataset_mode:
         # Generate sample images for visual inspection & metrics computation
-        if args.eval_save_model_every_epochs is not None and (
-            epoch % args.eval_save_model_every_epochs == 0
-            or (
-                args.precise_first_n_epochs is not None
-                and epoch < args.precise_first_n_epochs
-            )
-        ):
-            best_metric = generate_samples_compute_metrics_save_pipe(
-                args,
-                accelerator,
-                pipeline,
-                image_generation_tmp_save_folder,
-                fidelity_cache_root,
-                actual_eval_batch_sizes_for_this_process,
-                epoch,
-                global_step,
-                ema_models,
-                components_to_train_transcribed,
-                nb_classes,
-                logger,
-                dataset,
-                raw_dataset,
-                best_metric if accelerator.is_main_process else None,  # type: ignore
-                full_pipeline_save_folder,
-                repo,
+            if args.eval_save_model_every_epochs is not None and (
+                epoch % args.eval_save_model_every_epochs == 0
+                or (
+                    args.precise_first_n_epochs is not None
+                    and epoch < args.precise_first_n_epochs
+                )
+            ):
+                best_metric = generate_samples_compute_metrics_save_pipe(
+                    args,
+                    accelerator,
+                    pipeline,
+                    image_generation_tmp_save_folder,
+                    fidelity_cache_root,
+                    actual_eval_batch_sizes_for_this_process,
+                    epoch,
+                    global_step,
+                    ema_models,
+                    components_to_train_transcribed,
+                    nb_classes,
+                    logger,
+                    dataset,
+                    raw_dataset,
+                    best_metric if accelerator.is_main_process else None,  # type: ignore
+                    full_pipeline_save_folder,
+                    repo,
+                )
+        else:
+            logger.info("Evaluation on test set...")
+            test_metrics = evaluate_paired_dataset(
+                num_update_steps_per_epoch=num_update_steps_per_epoch,
+                accelerator=accelerator,
+                pipeline=pipeline,
+                epoch=epoch,
+                dataloader=test_dataloader,
+                split="test",
+                args=args,
+                global_step=global_step,
+                lr_scheduler=lr_scheduler,
+                logger=logger,
+                is_initial_benchmark=False,
             )
 
         # do not start new epoch before generation & pipeline saving is done

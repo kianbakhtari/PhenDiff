@@ -249,7 +249,7 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--paired_train_batch_size",
         type=int,
-        required=True,
+        required=False,
         help="Batch size (per device) for the pairedtraining dataloader.",
     )
     

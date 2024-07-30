@@ -327,7 +327,8 @@ def get_chckpt_save_path(
     if accelerator.is_main_process:
         os.makedirs(chckpt_save_path, exist_ok=True)
         
-    return os.path.join("/projects/deepdevpath2/Kian/PhenDiff/", chckpt_save_path)
+    # return os.path.join("/projects/deepdevpath2/Kian/PhenDiff/", chckpt_save_path)
+    return str(chckpt_save_path)
 
 
 def setup_logger(logger: MultiProcessAdapter, accelerator) -> None:

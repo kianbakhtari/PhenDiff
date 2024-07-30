@@ -24,6 +24,7 @@ from shutil import rmtree
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch import nn
 import torch_fidelity
 from accelerate import Accelerator
 from accelerate.logging import MultiProcessAdapter
@@ -191,7 +192,6 @@ def perform_training_epoch(
     # components common to all models
     denoiser_model = pipeline.unet
     denoiser_model.train()
-
     noise_scheduler = pipeline.scheduler
 
     # components specific to SD
@@ -200,21 +200,18 @@ def perform_training_epoch(
         autoencoder_model.train()
         # unwrap the autoencoder before calling it
         autoencoder_model = accelerator.unwrap_model(autoencoder_model)
-
         class_embedding = pipeline.class_embedding
         class_embedding.train()
     else:
         autoencoder_model = None
         class_embedding = None
 
-    # 2. Give me a pretty progress bar 🤩
     progress_bar = tqdm(
         total=num_update_steps_per_epoch,
         disable=not accelerator.is_local_main_process,
     )
     progress_bar.set_description(f"Epoch {epoch}")
 
-    # 3. Iterate over all batches
     for step, batch in enumerate(train_dataloader):
         # stop at tot_training_steps
         if global_step >= tot_training_steps:
@@ -375,7 +372,7 @@ def perform_training_epoch(
     return global_step, best_metric
 
 
-def paired_train_and_test_evaluation_and_log(
+def paired_dataset_visual_inspection_and_log(
         accelerator: Accelerator,
         global_step: int,
         source_images: torch.tensor,
@@ -387,8 +384,10 @@ def paired_train_and_test_evaluation_and_log(
             return tensor.detach()[:10].permute(0, 2, 3, 1).cpu().numpy()
 
     if accelerator.is_main_process:
-
         source_images_processed_for_logging = process(source_images)
+        target_images_processed_for_logging = process(target_images)
+        translated_images_processed_for_logging = process(translated_images)
+
         source_images_to_log = [
             wandb.Image(
                 source_images_processed_for_logging[i],
@@ -397,7 +396,6 @@ def paired_train_and_test_evaluation_and_log(
             for i in range(len(source_images_processed_for_logging))
         ]
 
-        target_images_processed_for_logging = process(target_images)
         target_images_to_log = [
             wandb.Image(
                 target_images_processed_for_logging[i],
@@ -406,7 +404,6 @@ def paired_train_and_test_evaluation_and_log(
             for i in range(len(target_images_processed_for_logging))
         ]
 
-        translated_images_processed_for_logging = process(translated_images)
         translated_images_to_log = [
             wandb.Image(
                 translated_images_processed_for_logging[i],
@@ -429,7 +426,7 @@ def paired_train_and_test_evaluation_and_log(
 
         accelerator.log(
             {
-                f"{split} data samples": table
+                f"{split} data samples - gs: {global_step}": table
             },
             step=global_step
         )
@@ -460,10 +457,15 @@ def perform_class_transfer_for_paired_training(
     repo,
     best_metric,
     chckpt_save_path: Path,
-    dataset,
-    raw_dataset,
 ) -> tuple[int, float | None]:
     
+    def make_tensor_binary(tensor: torch.Tensor) -> torch.Tensor:
+        # In our case, the input tensor is in the [-1, 1] range
+        tensor = torch.sigmoid(tensor)
+        tensor = torch.round(tensor)
+        assert torch.all((tensor == 0) | (tensor == 1)), "tensor should be binary."
+        return tensor
+        
     pipe = pipeline
     denoiser_model = pipeline.unet
     denoiser_model.train()
@@ -482,6 +484,8 @@ def perform_class_transfer_for_paired_training(
     progress_bar.set_description(f"Epoch {epoch}")
     
     # ----------- Iterate Over Batches ----------- #
+    do_visual_inspection_and_log = False
+
     sources_accu = []
     targets_accu = []
     translateds_accu = []
@@ -511,33 +515,31 @@ def perform_class_transfer_for_paired_training(
             process_idx=accelerator.process_index
         )
 
-        if len(sources_accu) < 10:
-            sources_accu.append(source_images)
-            targets_accu.append(target_images)
-            translateds_accu.append(translated_images)
-        
-        ##########
-        # def print_tensor_info(tensor, tensor_name):
-        #     print(f"{tensor_name}:")
-        #     print(f"  Shape: {tensor.shape}")
-        #     print(f"  Type: {tensor.dtype}")
-        #     print(f"  Min value: {tensor.min().item()}")
-        #     print(f"  Max value: {tensor.max().item()}")
-        #     print()
+        if torch.isnan(translated_images).any():
+            msg = "NaN values found in translated_images!"
+            logger.warn(f"\n{msg}")
+            accelerator.log({'warning': msg})
+        if torch.isinf(translated_images).any():
+            msg = "Inf values found in translated_images!"
+            logger.warn(f"\n{msg}")
+            accelerator.log({'warning': msg})
 
-        # if step % 10 == 0:
-        #     print_tensor_info(source_images, "source_images")
-        #     print_tensor_info(target_images, "target_images")
-        #     print_tensor_info(translated_images, "translated_images")
-        ##########
-
-        mse_loss = F.mse_loss(translated_images, target_images)
-        bce_loss = None # Default
+        clampped_translated_images = torch.clamp(translated_images, -1, 1)
+        mse_loss = F.mse_loss(clampped_translated_images, target_images)
+        bce_loss, dice_score = None, None # Default
 
         if args.paired_training_loss.lower().strip() == "bce":
-            bce_loss = F.binary_cross_entropy(translated_images, target_images)
+            assert target_images.unique() in [-1, 1], "target_images should be binary in {-1, 1}"
+            target_images = make_tensor_binary(target_images) # Going from {-1, 1} to {0, 1}
+            num_positive = (target_images == 1).sum().item()
+            num_negative = (target_images == 0).sum().item()
+            pos_weight = torch.tensor([num_negative / num_positive], dtype=torch.float32)
+            bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)(translated_images, target_images)
             accelerator.backward(bce_loss)
             loss_value = bce_loss
+
+            translated_images = make_tensor_binary(translated_images)
+            dice_score = dice_score(pred=translated_images, target=target_images)
         else:
             accelerator.backward(mse_loss)
             loss_value = mse_loss
@@ -545,6 +547,11 @@ def perform_class_transfer_for_paired_training(
         optimizer.step()
         lr_scheduler.step()
         optimizer.zero_grad()
+
+        if len(sources_accu) < 20:
+            sources_accu.append(source_images)
+            targets_accu.append(target_images)
+            translateds_accu.append(translated_images)
 
         # Checks if the accelerator has performed an optimization step behind the scenes
         if accelerator.sync_gradients:
@@ -563,6 +570,7 @@ def perform_class_transfer_for_paired_training(
         logs = {
             "train_bce": bce_loss,
             "train_mse": mse_loss,
+            "train_dice": dice_score,
             "lr": lr_scheduler.get_last_lr()[0],
             "step": global_step,
             "epoch": epoch,
@@ -584,17 +592,20 @@ def perform_class_transfer_for_paired_training(
             )
             logger.error(msg)
 
+        if global_step % 500 == 0:
+            do_visual_inspection_and_log = True
     progress_bar.close()
 
-    print("Epoch done, visual evaluation on train set...")
-    paired_train_and_test_evaluation_and_log(
-        accelerator=accelerator,
-        global_step=global_step,
-        source_images=torch.cat(sources_accu, dim=0),
-        target_images=torch.cat(targets_accu, dim=0),
-        translated_images=torch.cat(translateds_accu, dim=0),
-        split="train"
-    )
+    if do_visual_inspection_and_log:
+        print("Visual evaluation on train set...")
+        paired_dataset_visual_inspection_and_log(
+            accelerator=accelerator,
+            global_step=global_step,
+            source_images=torch.cat(sources_accu, dim=0),
+            target_images=torch.cat(targets_accu, dim=0),
+            translated_images=torch.cat(translateds_accu, dim=0),
+            split="train"
+        )
     
     accelerator.wait_for_everyone()
     return global_step, best_metric, loss_value
@@ -1393,10 +1404,12 @@ def _generate_save_images_for_this_class_DDIM(
                 (actual_bs,), class_label, device=pipeline.device
             ).long()
             class_emb = None
+        
         images = pipeline(
-            class_labels,
-            class_emb,
-            args.guidance_factor,
+            for_testing=True, # Kian: if we are here during unpaired training, this value doesn't have any effect since _original_no_grad_call will be called
+            class_labels=class_labels,
+            class_emb=class_emb,
+            w=args.guidance_factor,
             generator=generator,
             num_inference_steps=args.num_inference_steps,
             output_type="numpy",
@@ -1594,42 +1607,39 @@ def setup_fine_tuning(args, chckpt_save_path, logger):
     print(f"args.resume_from_checkpoint is updated: {args.resume_from_checkpoint}")
 
 
-def dice_score(pred, target):
-    """
-    Computes the Dice Score between the predicted and target segmentation masks.
-
-    Parameters:
-    pred (torch.Tensor): Predicted segmentation mask of shape [bs, ch, H, W], with values 0 or 1.
-    target (torch.Tensor): Ground truth segmentation mask of shape [bs, ch, H, W], with values 0 or 1.
-
-    Returns:
-    float: Dice score.
-    """
-    pred = (pred > 0.5).float()
-    target = (target > 0.5).float()
+def dice_score(pred: torch.Tensor, target: torch.Tensor) -> float:
+    assert pred.shape == target.shape, "pred and target should have the same shape."
+    assert torch.all((pred == 0) | (pred == 1)), "pred should have values 0 or 1."
+    assert torch.all((target == 0) | (target == 1)), "target should have values 0 or 1."
     
-    intersection = torch.sum(pred * target, dim=(2, 3))
-    pred_sum = torch.sum(pred, dim=(2, 3))
-    target_sum = torch.sum(target, dim=(2, 3))
+    pred_flat = pred.view(pred.size(0), pred.size(1), -1)
+    target_flat = target.view(target.size(0), target.size(1), -1)
     
+    intersection = torch.sum(pred_flat * target_flat, dim=2)
+    pred_sum = torch.sum(pred_flat, dim=2)
+    target_sum = torch.sum(target_flat, dim=2)
+
     dice = (2 * intersection) / (pred_sum + target_sum + 1e-8)
-
     return dice.mean().item()
 
 
-def evaluate_with_test_dataset(
+def evaluate_paired_dataset(
     num_update_steps_per_epoch: int,
     accelerator: Accelerator,
     pipeline: ConditionalDDIMPipeline,
     epoch: int,
     dataloader: DataLoader,
+    split: str,
     args: Namespace,
     global_step: int,
     lr_scheduler,
     logger: MultiProcessAdapter,
+    is_initial_benchmark: bool,
    
 ) -> tuple[int, float | None]:
     
+    assert split in ["train", "test"], f"split should be train or test, not {split}"
+
     pipe = pipeline
     denoiser_model = pipeline.unet
     denoiser_model.eval()
@@ -1645,7 +1655,7 @@ def evaluate_with_test_dataset(
         total=num_update_steps_per_epoch,
         disable=not accelerator.is_local_main_process,
     )
-    progress_bar.set_description(f"Test on epoch {epoch}")
+    progress_bar.set_description(f"evaluate_paired_dataset on epoch {epoch}")
     
     # ----------- Iterate Over Batches ----------- #
     mse_all, bce_all, dice_all = [], [], []
@@ -1656,7 +1666,7 @@ def evaluate_with_test_dataset(
     for step, batch in enumerate(
         tqdm(
             dataloader,
-            desc=f"Testing, iterating over batches...",
+            desc=f"evaluate_paired_dataset on {split} set...",
             position=0,
         )
     ):
@@ -1694,24 +1704,36 @@ def evaluate_with_test_dataset(
                 dice = dice_score(translated_images, target_images)
                 bce_all.append(bce.cpu().item())
                 dice_all.append(dice.cpu().item())
+    
+    if is_initial_benchmark:
+        logs = {
+            f"benchmark_{split}_mse": np.array(mse_all).mean(),
+            f"benchmark_{split}_bce": np.array(bce_all).mean(),
+            f"benchmark_{split}_dice": np.array(dice_all).mean(),
+            "lr": lr_scheduler.get_last_lr()[0],
+            "step": global_step,
+            "epoch": epoch,
+        }
+    else:
+        logs = {
+            f"{split}_mse": np.array(mse_all).mean(),
+            f"{split}_bce": np.array(bce_all).mean(),
+            f"{split}_dice": np.array(dice_all).mean(),
+            "lr": lr_scheduler.get_last_lr()[0],
+            "step": global_step,
+            "epoch": epoch,
+        }
 
-    test_logs = {
-        "test_mse": np.array(mse_all).mean(),
-        "test_bce": np.array(bce_all).mean(),
-        "test_dice": np.array(dice_all).mean(),
-        "lr": lr_scheduler.get_last_lr()[0],
-        "step": global_step,
-        "epoch": epoch,
-    }
-    accelerator.log(test_logs, step=global_step)
+    accelerator.log(logs, step=global_step)
     accelerator.wait_for_everyone()
 
-    paired_train_and_test_evaluation_and_log(
-        accelerator=accelerator,
-        global_step=global_step,
-        source_images=torch.cat(sources_accu, dim=0),
-        target_images=torch.cat(targets_accu, dim=0),
-        translated_images=torch.cat(translateds_accu, dim=0),
-        split="test"
-    )
-    return test_logs
+    if is_initial_benchmark or global_step % 500 == 0:
+        paired_dataset_visual_inspection_and_log(
+            accelerator=accelerator,
+            global_step=global_step,
+            source_images=torch.cat(sources_accu, dim=0),
+            target_images=torch.cat(targets_accu, dim=0),
+            translated_images=torch.cat(translateds_accu, dim=0),
+            split=split
+        )
+    return logs

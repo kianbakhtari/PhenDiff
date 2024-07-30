@@ -6,9 +6,9 @@
 echo -e "\n<--------------------------------------- launch_script_DDIM.sh --------------------------------------->\n"
 
 # ------------------------------------------> Variables <------------------------------------------
-exp_name=FineTune-mock # experiment and output folder name; common to all runs in the same experiment
+exp_name=PhenDiff # experiment and output folder name; common to all runs in the same experiment
 
-run_name=TN_binary_from_PhenDiff_TN_cond_super_small_denoiser_config_25000-S2 # wandb run display name
+run_name=TN_binary_single_channel # wandb run display name
 
 exp_dirs_parent_folder=./experiments
 model_configs_folder=./models_configs
@@ -31,7 +31,7 @@ ${acc_cfg}
 --rdzv_backend=static
 --same_network
 --dynamo_backend=no
---gpu_ids 0
+--gpu_ids 2
 --main_process_port=29501
 "
 # --main_process_port=29501
@@ -49,20 +49,11 @@ $1
 --denoiser_config_path ${model_configs_folder}/denoiser/super_small.json
 --noise_scheduler_config_path ${model_configs_folder}/noise_scheduler/3k_steps_clipping_rescaling.json
 --num_inference_steps 50
---train_data_dir /projects/deepdevpath2/Kian/datasets/TissueNet/TN-InstSeg/nuc/
---train_batch_size 112
+--train_data_dir /projects/deepdevpath2/Kian/datasets/TissueNet/TN-binary/nuc/
+--train_batch_size 128
 
---fine_tune_with_paired_dataset_mode translation
---fine_tune_experiment_by_paired_training /projects/deepdevpath2/Kian/PhenDiff/experiments/PhenDiff/PhenDiff_TN_cond_super_small_denoiser_config/checkpoints/step_25000
-
---paired_train_data_dir /projects/deepdevpath2/Kian/datasets/TissueNet/TN-binary-paired/nuc/
---test_data_dir /projects/deepdevpath2/Kian/datasets/TissueNet/TN-binary-test/nuc/train/
---source_class_for_paired_training images
---paired_training_loss mse
---paired_train_batch_size 2
-
---denoiser_in_channels 3
---denoiser_out_channels 3
+--denoiser_in_channels 1
+--denoiser_out_channels 1
 --definition 128
 --eval_batch_size 256
 --max_num_steps 70000
@@ -80,13 +71,13 @@ $1
 --wandb_entity kian-team
 "
 
-
-# --paired_train_data_dir a
-# --source_class_for_paired_training a
-# --perform_sample_prediction_for_paired_training_every_epochs 0
-# --perform_translation_for_paired_training_every_epochs 0
-# --resume_from_checkpoint step_50000
-
+# --fine_tune_with_paired_dataset_mode translation
+# --fine_tune_experiment_by_paired_training /projects/deepdevpath2/Kian/PhenDiff/experiments/PhenDiff/PhenDiff_TN_cond_super_small_denoiser_config/checkpoints/step_25000
+# --paired_train_data_dir /projects/deepdevpath2/Kian/datasets/TissueNet/TN-binary-paired/nuc/
+# --test_data_dir /projects/deepdevpath2/Kian/datasets/TissueNet/TN-binary-test/nuc/train/
+# --source_class_for_paired_training images
+# --paired_training_loss mse
+# --paired_train_batch_size 2
 
 
 # ----------------------------------------> Echo commands <----------------------------------------
