@@ -103,7 +103,7 @@ class PairedSamplesDataset(Dataset):
     source_class: for one-way translation tasks involving source and target classes, like segmentation.
     """
 
-    def __init__(self, root : str, source_class : Optional[str] = None, transform: JointTransforms = None):
+    def __init__(self, args, root : str, source_class : Optional[str] = None, transform: JointTransforms = None):
         root = os.path.abspath(root)
         class_directories = glob.glob(os.path.join(root, '*'))
         assert len(class_directories) == 2, f"There sould be two and only two classes under the root: {root}"
@@ -125,6 +125,10 @@ class PairedSamplesDataset(Dataset):
         self.source_class = source_class
         if self.source_class is not None:
             assert self.source_class in self.classes, f"source_class {source_class} incompatible with classes: {self.classes}"
+        
+        self.convert_to_rgb = True
+        if args.denoiser_in_channels == 1:
+            self.convert_to_rgb = False
 
     def find_classes(self, directory: Union[str, Path]) -> Tuple[List[str], Dict[str, int]]:
         """Finds the class folders in a dataset.
@@ -145,10 +149,13 @@ class PairedSamplesDataset(Dataset):
     def __getitem__(self, idx):
         imgA_path = os.path.join(self.classA_dir, self.images[idx])
         imgB_path = os.path.join(self.classB_dir, self.images[idx])
-        imgA = Image.open(imgA_path).convert("RGB")
-        imgB = Image.open(imgB_path).convert("RGB")
-        # imgA = read_image(imgA_path)
-        # imgB = read_image(imgB_path)
+
+        if self.convert_to_rgb:
+            imgA = Image.open(imgA_path).convert("RGB")
+            imgB = Image.open(imgB_path).convert("RGB")
+        else:
+            imgA = Image.open(imgA_path)
+            imgB = Image.open(imgB_path)
         
         if self.transform is not None:
             imgA, imgB = self.transform(imgA, imgB)
@@ -181,8 +188,16 @@ def setup_dataset(
     # download the dataset.
 
     #################################################
+    # def default_loader(path: str) -> Image.Image:
+    #     with open(path, "rb") as f:
+    #         img = Image.open(BytesIO(f.read()))
+    #         # img_array = np.array(img)
+    #         # print("\n\n\nPIl LOADER")
+    #         # print(img_array.shape)
+    #         return img
+
     def pil_loader(path: str) -> Image.Image:
-    # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
+        # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
         with open(path, "rb") as f:
             img = Image.open(BytesIO(f.read()))
             return img
@@ -191,7 +206,6 @@ def setup_dataset(
         import accimage
 
         try:
-            print("\n\nACCC\n\n")
             return accimage.Image(path)
         except OSError:
             # Potentially a decoding problem, fall back to PIL.Image
@@ -215,17 +229,28 @@ def setup_dataset(
             split="train",
         )
     elif args.use_pytorch_loader:
-        dataset: ImageFolder | Subset = ImageFolder(
-            root=Path(args.train_data_dir, args.split).as_posix(),
-            transform=lambda x: transformations(x), ########################### Kian: I removed x.convert("RGB") in this line.
-            target_transform=lambda y: torch.tensor(y).long(),
-            loader=default_loader,
-        )
-        raw_dataset: NoLabelsDataset | Subset = NoLabelsDataset(
-            root=Path(args.train_data_dir, args.split).as_posix(),
-            transform=lambda x: raw_transformations(x), ########################### Kian: I removed x.convert("RGB") in this line.
-            loader=default_loader,
-        )
+        if args.denoiser_in_channels == 1:
+            dataset: ImageFolder | Subset = ImageFolder(
+                root=Path(args.train_data_dir, args.split).as_posix(),
+                transform=lambda x: transformations(x),
+                target_transform=lambda y: torch.tensor(y).long(),
+                loader=default_loader,
+            )
+            raw_dataset: NoLabelsDataset | Subset = NoLabelsDataset(
+                root=Path(args.train_data_dir, args.split).as_posix(),
+                transform=lambda x: raw_transformations(x),
+                loader=default_loader,
+            )
+        else:
+            dataset: ImageFolder | Subset = ImageFolder(
+                root=Path(args.train_data_dir, args.split).as_posix(),
+                transform=lambda x: transformations(x),
+                target_transform=lambda y: torch.tensor(y).long(),
+            )
+            raw_dataset: NoLabelsDataset | Subset = NoLabelsDataset(
+                root=Path(args.train_data_dir, args.split).as_posix(),
+                transform=lambda x: raw_transformations(x),
+            )
         assert len(dataset) == len(
             raw_dataset
         ), "dataset and raw_dataset should have the same length"
@@ -300,6 +325,7 @@ def setup_paired_dataset(
 
     if test_split:
         test_dataset: PairedSamplesDataset = PairedSamplesDataset(
+        args,
         root=Path(args.test_data_dir).as_posix(), 
         source_class=args.source_class_for_paired_training,
         transform=JointTransforms(args, h_flip_prob=0, v_flip_prob=0),
@@ -307,6 +333,7 @@ def setup_paired_dataset(
         return test_dataset
 
     paired_dataset: PairedSamplesDataset = PairedSamplesDataset(
+        args,
         root=Path(args.paired_train_data_dir, args.split).as_posix(), # Kian: args.split is "train" by default.
         source_class=args.source_class_for_paired_training,
         transform=JointTransforms(args),

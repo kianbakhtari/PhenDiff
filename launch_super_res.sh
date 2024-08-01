@@ -6,9 +6,11 @@
 echo -e "\n<--------------------------------------- launch_script_DDIM.sh --------------------------------------->\n"
 
 # ------------------------------------------> Variables <------------------------------------------
-exp_name=FineTune # experiment and output folder name; common to all runs in the same experiment
+# experiment and output folder name; common to all runs in the same experiment
+exp_name=Super-Res-FineTune
 
-run_name=TN_binary_single_channel_BCE_from_same_58000_MEDIUM # wandb run display name
+# wandb run display name
+run_name=4x
 
 exp_dirs_parent_folder=./experiments
 model_configs_folder=./models_configs
@@ -31,8 +33,8 @@ ${acc_cfg}
 --rdzv_backend=static
 --same_network
 --dynamo_backend=no
---gpu_ids 3
---main_process_port=29504
+--gpu_ids 1
+--main_process_port=29503
 "
 # --main_process_port=29501
 
@@ -48,23 +50,24 @@ $1
 --components_to_train denoiser
 --denoiser_config_path ${model_configs_folder}/denoiser/super_small.json
 --noise_scheduler_config_path ${model_configs_folder}/noise_scheduler/3k_steps_clipping_rescaling.json
---num_inference_steps 50
---train_data_dir /projects/deepdevpath2/Kian/datasets/TissueNet/TN-binary/nuc/
+--num_inference_steps 30
+--train_data_dir /projects/deepdevpath2/Kian/datasets/KDSB/
+--fine_tune_with_paired_dataset None
 --train_batch_size 128
 
 --fine_tune_with_paired_dataset_mode translation
---fine_tune_experiment_by_paired_training /projects/deepdevpath2/Kian/PhenDiff/experiments/PhenDiff/TN_binary_single_channel/checkpoints/step_58000
---paired_train_data_dir /projects/deepdevpath2/Kian/datasets/TissueNet/TN-binary-paired-medium/nuc/
---test_data_dir /projects/deepdevpath2/Kian/datasets/TissueNet/TN-binary-test/nuc/train/
---source_class_for_paired_training images
---paired_training_loss bce
+--fine_tune_experiment_by_paired_training 
+--paired_train_data_dir 
+--test_data_dir 
+--source_class_for_paired_training 
+--paired_training_loss mse
 --paired_train_batch_size 2
 
---denoiser_in_channels 1
---denoiser_out_channels 1
+--denoiser_in_channels 3
+--denoiser_out_channels 3
 --definition 128
 --eval_batch_size 256
---max_num_steps 62000
+--max_num_steps 55000
 --learning_rate 3e-4
 --mixed_precision fp16
 --eval_save_model_every_epochs 50
@@ -80,13 +83,12 @@ $1
 "
 
 # --fine_tune_with_paired_dataset_mode translation
-# --fine_tune_experiment_by_paired_training /projects/deepdevpath2/Kian/PhenDiff/experiments/PhenDiff/PhenDiff_TN_cond_super_small_denoiser_config/checkpoints/step_25000
-# --paired_train_data_dir /projects/deepdevpath2/Kian/datasets/TissueNet/TN-binary-paired/nuc/
-# --test_data_dir /projects/deepdevpath2/Kian/datasets/TissueNet/TN-binary-test/nuc/train/
+# --fine_tune_experiment_by_paired_training /projects/deepdevpath2/Kian/PhenDiff/experiments/PhenDiff/KDSB/checkpoints/step_50000
+# --paired_train_data_dir /projects/deepdevpath2/Kian/datasets/KDSB/KDSB-paired-small/
+# --test_data_dir /projects/deepdevpath2/Kian/datasets/KDSB/KDSB-test/
 # --source_class_for_paired_training images
 # --paired_training_loss mse
 # --paired_train_batch_size 2
-
 
 # ----------------------------------------> Echo commands <----------------------------------------
 echo -e "START TIME: $(date)\n"
@@ -100,4 +102,4 @@ echo -e "MAIN_SCRIPT_ARGS: ${MAIN_SCRIPT_ARGS}\n"
 # Launch the job
 accelerate launch ${ACCELERATE_CONFIG} ${MAIN_SCRIPT} ${MAIN_SCRIPT_ARGS}
 
-exit 0
+exit 0v

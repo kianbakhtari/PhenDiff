@@ -460,7 +460,7 @@ def perform_class_transfer_for_paired_training(
 ) -> tuple[int, float | None]:
     
     def make_tensor_binary(tensor: torch.Tensor) -> torch.Tensor:
-        # In our case, the input tensor is in the [-1, 1] range
+        # The input tensor should be centered around 0
         tensor = torch.sigmoid(tensor)
         tensor = torch.round(tensor)
         assert torch.all((tensor == 0) | (tensor == 1)), "tensor should be binary."
@@ -526,20 +526,20 @@ def perform_class_transfer_for_paired_training(
 
         clampped_translated_images = torch.clamp(translated_images, -1, 1)
         mse_loss = F.mse_loss(clampped_translated_images, target_images)
-        bce_loss, dice_score = None, None # Default
+        bce_loss_value, dice = None, None # Default
 
         if args.paired_training_loss.lower().strip() == "bce":
-            assert target_images.unique() in [-1, 1], "target_images should be binary in {-1, 1}"
+            assert all(value in [-1, 1] for value in target_images.unique()), "target_images should be binary in {-1, 1}"
             target_images = make_tensor_binary(target_images) # Going from {-1, 1} to {0, 1}
             num_positive = (target_images == 1).sum().item()
             num_negative = (target_images == 0).sum().item()
-            pos_weight = torch.tensor([num_negative / num_positive], dtype=torch.float32)
+            pos_weight = torch.tensor([num_negative / (num_positive + 1e-3)], dtype=torch.float32).to(accelerator.device)
             bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)(translated_images, target_images)
             accelerator.backward(bce_loss)
-            loss_value = bce_loss
+            loss_value, bce_loss_value = bce_loss, bce_loss.item()
 
             translated_images = make_tensor_binary(translated_images)
-            dice_score = dice_score(pred=translated_images, target=target_images)
+            dice = dice_score(pred=translated_images, target=target_images)
         else:
             accelerator.backward(mse_loss)
             loss_value = mse_loss
@@ -568,9 +568,9 @@ def perform_class_transfer_for_paired_training(
             )
 
         logs = {
-            "train_bce": bce_loss,
+            "train_bce": bce_loss_value,
             "train_mse": mse_loss,
-            "train_dice": dice_score,
+            "train_dice": dice,
             "lr": lr_scheduler.get_last_lr()[0],
             "step": global_step,
             "epoch": epoch,
@@ -594,6 +594,7 @@ def perform_class_transfer_for_paired_training(
 
         if global_step % 500 == 0:
             do_visual_inspection_and_log = True
+
     progress_bar.close()
 
     if do_visual_inspection_and_log:
@@ -1635,20 +1636,26 @@ def evaluate_paired_dataset(
     lr_scheduler,
     logger: MultiProcessAdapter,
     is_initial_benchmark: bool,
+    do_visual_inspection: bool,
    
 ) -> tuple[int, float | None]:
     
     assert split in ["train", "test"], f"split should be train or test, not {split}"
 
+    def make_tensor_binary(tensor: torch.Tensor) -> torch.Tensor:
+        # The input tensor should be centered around 0
+        tensor = torch.sigmoid(tensor)
+        tensor = torch.round(tensor)
+        assert torch.all((tensor == 0) | (tensor == 1)), "tensor should be binary."
+        return tensor
+
     pipe = pipeline
     denoiser_model = pipeline.unet
     denoiser_model.eval()
     num_inference_steps = 30
-    # ----------- Distributed inference & device placement ----------- #
+
     dataloader = accelerator.prepare(dataloader)
     # pipe = pipe.to(accelerator.device)
-
-    # ----------- Creat save directories ----------- #
     accelerator.wait_for_everyone()
 
     progress_bar = tqdm(
@@ -1690,21 +1697,45 @@ def evaluate_paired_dataset(
                 process_idx=accelerator.process_index
             )
 
+            if torch.isnan(translated_images).any():
+                msg = "NaN values found in translated_images!"
+                logger.warn(f"\n{msg}")
+                accelerator.log({'warning': msg})
+            if torch.isinf(translated_images).any():
+                msg = "Inf values found in translated_images!"
+                logger.warn(f"\n{msg}")
+                accelerator.log({'warning': msg})
+
+            clampped_translated_images = torch.clamp(translated_images, -1, 1)
+            mse = F.mse_loss(clampped_translated_images, target_images)
+            mse_all.append(mse.cpu().item())
+            bce, dice = None, None # Default
+
+            if args.paired_training_loss.lower().strip() == "bce":
+                # assert all(value in [-1, 1] for value in target_images.unique()), "target_images should be binary in {-1, 1}"
+                if not all(value in [-1, 1] for value in target_images.unique()):
+                    print("\nHere")
+                    print(target_images.unique())
+                    exit()
+
+                target_images = make_tensor_binary(target_images) # Going from {-1, 1} to {0, 1}
+                num_positive = (target_images == 1).sum().item()
+                num_negative = (target_images == 0).sum().item()
+                pos_weight = num_negative / (num_positive + 1e-3)
+                bce = F.binary_cross_entropy_with_logits(
+                    translated_images, target_images, pos_weight=torch.tensor(pos_weight).to(accelerator.device)
+                )
+                translated_images = make_tensor_binary(translated_images)
+                dice = dice_score(pred=translated_images, target=target_images)
+
+                bce_all.append(bce.cpu().item())
+                dice_all.append(dice)
+
             if len(sources_accu) < 20:
                 sources_accu.append(source_images)
                 targets_accu.append(target_images)
                 translateds_accu.append(translated_images)
             
-            mse = F.mse_loss(translated_images, target_images)
-            mse_all.append(mse.cpu().item())
-
-            bce, dice = None, None
-            if args.paired_training_loss == "bce":
-                bce = F.binary_cross_entropy(translated_images, target_images)
-                dice = dice_score(translated_images, target_images)
-                bce_all.append(bce.cpu().item())
-                dice_all.append(dice.cpu().item())
-    
     if is_initial_benchmark:
         logs = {
             f"benchmark_{split}_mse": np.array(mse_all).mean(),
@@ -1727,7 +1758,7 @@ def evaluate_paired_dataset(
     accelerator.log(logs, step=global_step)
     accelerator.wait_for_everyone()
 
-    if is_initial_benchmark or global_step % 500 == 0:
+    if do_visual_inspection:
         paired_dataset_visual_inspection_and_log(
             accelerator=accelerator,
             global_step=global_step,

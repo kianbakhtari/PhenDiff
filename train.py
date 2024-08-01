@@ -181,6 +181,7 @@ def main(args: Namespace):
         pin_memory=args.pin_memory
     )
 
+    paired_dataloader = None
     if args.paired_train_data_dir is not None:
         paired_dataset = setup_paired_dataset(args, logger)
         paired_dataloader = torch.utils.data.DataLoader(  # type: ignore
@@ -192,9 +193,8 @@ def main(args: Namespace):
             persistent_workers=args.persistent_workers,
             pin_memory=args.pin_memory
         )
-    else:
-        paired_dataloader = None
-
+        
+    test_dataloader = None
     if args.test_data_dir is not None:
         test_dataset = setup_paired_dataset(args, logger, test_split=True)
         test_dataloader = torch.utils.data.DataLoader(  # type: ignore
@@ -206,9 +206,7 @@ def main(args: Namespace):
             persistent_workers=args.persistent_workers,
             pin_memory=args.pin_memory
         )
-    else:
-        test_dataloader = None
-
+        
     # ------------------------------------ Debug -------------------------------------
     if args.debug:
         modify_args_for_debug(logger, args, len(train_dataloader))
@@ -417,9 +415,21 @@ def main(args: Namespace):
         raise ValueError(f"args.fine_tune_with_paired_dataset_mode should be either sample or translation,\
                 not {args.fine_tune_with_paired_dataset_mode}")
     
-    # Initial evaluation on train and test datasets in case of paired training (fine tuning)
+    # Some things to do before paired dataset fine-tuning
     if args.fine_tune_with_paired_dataset_mode in ["sample", "translation"]:
-        # On train dataset
+        # Reseting the learning rate to the oroiginal value
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = args.learning_rate
+        
+        lr_scheduler = get_scheduler(
+            args.lr_scheduler,
+            optimizer=optimizer,
+            num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+            num_training_steps=tot_training_steps,
+        )
+        lr_scheduler = accelerator.prepare(lr_scheduler)
+
+        # Initial evaluation on train dataset
         initial_train_metrics = evaluate_paired_dataset(
                 num_update_steps_per_epoch=num_update_steps_per_epoch,
                 accelerator=accelerator,
@@ -432,8 +442,10 @@ def main(args: Namespace):
                 lr_scheduler=lr_scheduler,
                 logger=logger,
                 is_initial_benchmark=True,
+                do_visual_inspection=True,
             )
-        # On test dataset
+
+        # Initial evaluation on test dataset
         initial_test_metrics = evaluate_paired_dataset(
                 num_update_steps_per_epoch=num_update_steps_per_epoch,
                 accelerator=accelerator,
@@ -446,9 +458,11 @@ def main(args: Namespace):
                 lr_scheduler=lr_scheduler,
                 logger=logger,
                 is_initial_benchmark=True,
+                do_visual_inspection=True,
             )
 
-    # --------------------------------- Training loop --------------------------------    
+    # --------------------------------- Training loop -------------------------------- 
+    last_global_step_of_test_visual_inspection = 0  
     while (
         epoch < (args.max_num_epochs if args.max_num_epochs is not None else inf)
         and global_step < tot_training_steps
@@ -575,6 +589,9 @@ def main(args: Namespace):
                 )
         else:
             logger.info("Evaluation on test set...")
+            do_visual_inspection = True if global_step - last_global_step_of_test_visual_inspection > 500 else False
+            if do_visual_inspection:
+                last_global_step_of_test_visual_inspection = global_step
             test_metrics = evaluate_paired_dataset(
                 num_update_steps_per_epoch=num_update_steps_per_epoch,
                 accelerator=accelerator,
@@ -587,6 +604,7 @@ def main(args: Namespace):
                 lr_scheduler=lr_scheduler,
                 logger=logger,
                 is_initial_benchmark=False,
+                do_visual_inspection=do_visual_inspection,
             )
 
         # do not start new epoch before generation & pipeline saving is done
