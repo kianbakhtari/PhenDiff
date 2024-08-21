@@ -1,0 +1,60 @@
+############################################# DEFAULTS ############################################
+defaults:
+- class_transfer_method:
+  # - linear_interp_custom_guidance_inverted_start
+  # - classifier_free_guidance_forward_start
+  - ddib
+  - inverted_regeneration
+- dataset: BBBC021_comp_conc_nice_phen_high_conc_balanced_no_aug
+- pipeline:
+  - DDIM
+  # - SD
+- batch_size: 128/v100-32gb
+- _self_
+
+####################################### EXPERIMENT VARIABLES ######################################
+exp_parent_folder: ./experiments
+path_to_script_parent_folder: /projects/deepdevpath/Thomas/diffusion-comparison-experiments
+entity: imgimg-diffusion
+project: REMOVE_functional_test
+run_name: debug
+
+############################################## HYDRA ##############################################
+hydra:
+  run:
+    dir: ${exp_parent_folder}/${project}/${run_name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+############################################## SLURM ##############################################
+slurm:
+  enabled: false
+  monitor: false
+  signal_time: 300
+  email: tboyer@bio.ens.psl.eu
+  output_folder: ${hydra:run.dir}
+  num_gpus: null
+
+############################################## SWEEP ##############################################
+sweep_metric: null # TODO: retrieve from sweep cfg
+
+############################################ ACCELERATE ###########################################
+accelerate:
+  launch_args:
+    machine_rank: 0
+    num_machines: 1
+    gpu_ids: 0,1,2,
+    rdzv_backend: static
+    same_network: true
+    mixed_precision: fp16
+    num_processes: 3
+    dynamo_backend: "no"
+    multi_gpu: false
+  offline: false
+
+############################################# METRICS #############################################
+compute_fid: true
+compute_isc: true
+compute_kid: true
+kid_subset_size: 1000 # 1000 is the default in torch-fidelity
+
+########################################## MISCELLANEOUS ##########################################
+debug: true

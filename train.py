@@ -25,10 +25,11 @@ from diffusers.training_utils import EMAModel
 
 import wandb
 from src.args_parser import parse_args
-from src.utils_dataset import setup_dataset
+from src.utils_dataset import setup_dataset, setup_paired_dataset
 from src.utils_misc import (
     args_checker,
     create_repo_structure,
+    get_chckpt_save_path,
     get_HF_component_names,
     get_initial_best_metric,
     modify_args_for_debug,
@@ -41,12 +42,21 @@ from src.utils_training import (
     perform_training_epoch,
     resume_from_checkpoint,
     save_pipeline,
+    perform_class_transfer_for_paired_training,
+    perform_sample_prediction_for_paired_training,
+    setup_fine_tuning,
+    evaluate_paired_dataset,
+    EpochTimer
 )
+from src.utils_Img2Img import ClassTransferExperimentParams
 
 logger: MultiProcessAdapter = get_logger(__name__, log_level="INFO")
 
 
 def main(args: Namespace):
+    #####
+    visual_inspection_interval = 250 # Also in utils training, needs to be same and set in the args
+
     # ---------------------------------- Accelerator ---------------------------------
     accelerator_project_config = ProjectConfiguration(
         total_limit=args.checkpoints_total_limit,
@@ -72,6 +82,13 @@ def main(args: Namespace):
         project_config=accelerator_project_config,
         kwargs_handlers=kwargs_handlers,  # type: ignore
     )
+
+    # ----------------------------- Setup pre-trained model -----------------------------
+    # Setup pre-trained model if fine-tuning with paired dataset
+    if accelerator.is_main_process and args.fine_tune_experiment_by_paired_training:
+        chckpt_save_path = get_chckpt_save_path(args, accelerator, logger)
+        setup_fine_tuning(args, chckpt_save_path, logger)
+    accelerator.wait_for_everyone()
 
     # ----------------------------- Repository Structure -----------------------------
     (
@@ -157,6 +174,7 @@ def main(args: Namespace):
         if args.dataloader_num_workers is not None
         else accelerator.num_processes
     )
+
     train_dataloader = torch.utils.data.DataLoader(  # type: ignore
         dataset,
         batch_size=args.train_batch_size,
@@ -167,6 +185,32 @@ def main(args: Namespace):
         pin_memory=args.pin_memory
     )
 
+    paired_dataloader = None
+    if args.paired_train_data_dir is not None:
+        paired_dataset = setup_paired_dataset(args, logger)
+        paired_dataloader = torch.utils.data.DataLoader(  # type: ignore
+            paired_dataset,
+            batch_size=args.paired_train_batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            prefetch_factor=args.dataloader_prefetch_factor,
+            persistent_workers=args.persistent_workers,
+            pin_memory=args.pin_memory
+        )
+        
+    test_dataloader = None
+    if args.test_data_dir is not None:
+        test_dataset = setup_paired_dataset(args, logger, test_split=True)
+        test_dataloader = torch.utils.data.DataLoader(  # type: ignore
+            test_dataset,
+            batch_size=args.paired_train_batch_size * 2,
+            shuffle=False,
+            num_workers=num_workers,
+            prefetch_factor=args.dataloader_prefetch_factor,
+            persistent_workers=args.persistent_workers,
+            pin_memory=args.pin_memory
+        )
+        
     # ------------------------------------ Debug -------------------------------------
     if args.debug:
         modify_args_for_debug(logger, args, len(train_dataloader))
@@ -179,7 +223,7 @@ def main(args: Namespace):
     # here they are only used as convenient "supermodel" wrappers
     pipeline = load_initial_pipeline(
         args, initial_pipeline_save_folder, logger, nb_classes, accelerator
-    )
+    ) # Kian: ConditionalDDIMPipeline
 
     # --------------------------- Move & Freeze Components ---------------------------
     # Move components to device
@@ -364,67 +408,210 @@ def main(args: Namespace):
     if accelerator.is_main_process:
         best_metric = get_initial_best_metric()
 
-    # --------------------------------- Training loop --------------------------------
+    # --------------------------------- Getting Ready For Training --------------------------------
+    if not args.fine_tune_with_paired_dataset_mode:
+        logger.info("Training with unpaired dataset...")
+    elif args.fine_tune_with_paired_dataset_mode == "sample":
+        logger.info("Training with paired dataset, sample prediction...")
+    elif args.fine_tune_with_paired_dataset_mode == "translation":
+        logger.info("Training with paired dataset, translation...")
+    else:
+        raise ValueError(f"args.fine_tune_with_paired_dataset_mode should be either sample or translation,\
+                not {args.fine_tune_with_paired_dataset_mode}")
+    
+    # Some things to do before paired dataset fine-tuning
+    if args.fine_tune_with_paired_dataset_mode in ["sample", "translation"]:
+        # Reseting the learning rate to the oroiginal value
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = args.learning_rate
+        
+        lr_scheduler = get_scheduler(
+            args.lr_scheduler,
+            optimizer=optimizer,
+            num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+            num_training_steps=tot_training_steps,
+        )
+        lr_scheduler = accelerator.prepare(lr_scheduler)
+
+        # Initial evaluation on train dataset
+        initial_train_metrics = evaluate_paired_dataset(
+                num_update_steps_per_epoch=num_update_steps_per_epoch,
+                accelerator=accelerator,
+                pipeline=pipeline,
+                epoch=epoch,
+                dataloader=paired_dataloader,
+                split="train",
+                args=args,
+                global_step=global_step,
+                lr_scheduler=lr_scheduler,
+                logger=logger,
+                is_initial_benchmark=True,
+                do_visual_inspection=True,
+            )
+
+        # Initial evaluation on test dataset
+        initial_test_metrics = evaluate_paired_dataset(
+                num_update_steps_per_epoch=num_update_steps_per_epoch,
+                accelerator=accelerator,
+                pipeline=pipeline,
+                epoch=epoch,
+                dataloader=test_dataloader,
+                split="test",
+                args=args,
+                global_step=global_step,
+                lr_scheduler=lr_scheduler,
+                logger=logger,
+                is_initial_benchmark=True,
+                do_visual_inspection=True,
+            )
+        
+        epoch_timer = EpochTimer()
+
+    # --------------------------------- Training loop -------------------------------- 
+    last_global_step_of_test_visual_inspection = 0  
     while (
         epoch < (args.max_num_epochs if args.max_num_epochs is not None else inf)
         and global_step < tot_training_steps
     ):
-        # Training epoch
-        global_step, best_metric = perform_training_epoch(
-            num_update_steps_per_epoch=num_update_steps_per_epoch,
-            accelerator=accelerator,
-            pipeline=pipeline,
-            ema_models=ema_models,
-            components_to_train_transcribed=components_to_train_transcribed,
-            epoch=epoch,
-            train_dataloader=train_dataloader,
-            args=args,
-            first_epoch=first_epoch,
-            resume_step=resume_step,
-            global_step=global_step,
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
-            logger=logger,
-            params_to_clip=params_to_optimize,
-            tot_training_steps=tot_training_steps,
-            image_generation_tmp_save_folder=image_generation_tmp_save_folder,
-            fidelity_cache_root=fidelity_cache_root,
-            actual_eval_batch_sizes_for_this_process=actual_eval_batch_sizes_for_this_process,
-            nb_classes=nb_classes,
-            dataset=dataset,
-            raw_dataset=raw_dataset,
-            full_pipeline_save_folder=full_pipeline_save_folder,
-            repo=repo,
-            best_metric=best_metric if accelerator.is_main_process else None,  # type: ignore
-            chckpt_save_path=chckpt_save_path,
-        )
+        if not args.fine_tune_with_paired_dataset_mode:
 
-        # Generate sample images for visual inspection & metrics computation
-        if args.eval_save_model_every_epochs is not None and (
-            epoch % args.eval_save_model_every_epochs == 0
-            or (
-                args.precise_first_n_epochs is not None
-                and epoch < args.precise_first_n_epochs
+            global_step, best_metric = perform_training_epoch(
+                num_update_steps_per_epoch=num_update_steps_per_epoch,
+                accelerator=accelerator,
+                pipeline=pipeline,
+                ema_models=ema_models,
+                components_to_train_transcribed=components_to_train_transcribed,
+                epoch=epoch,
+                train_dataloader=train_dataloader,
+                args=args,
+                first_epoch=first_epoch,
+                resume_step=resume_step,
+                global_step=global_step,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                logger=logger,
+                params_to_clip=params_to_optimize,
+                tot_training_steps=tot_training_steps,
+                image_generation_tmp_save_folder=image_generation_tmp_save_folder,
+                fidelity_cache_root=fidelity_cache_root,
+                actual_eval_batch_sizes_for_this_process=actual_eval_batch_sizes_for_this_process,
+                nb_classes=nb_classes,
+                dataset=dataset,
+                raw_dataset=raw_dataset,
+                full_pipeline_save_folder=full_pipeline_save_folder,
+                repo=repo,
+                best_metric=best_metric if accelerator.is_main_process else None,  # type: ignore
+                chckpt_save_path=chckpt_save_path,
+                paired_dataloader=paired_dataloader
             )
-        ):
-            best_metric = generate_samples_compute_metrics_save_pipe(
-                args,
-                accelerator,
-                pipeline,
-                image_generation_tmp_save_folder,
-                fidelity_cache_root,
-                actual_eval_batch_sizes_for_this_process,
-                epoch,
-                global_step,
-                ema_models,
-                components_to_train_transcribed,
-                nb_classes,
-                logger,
-                dataset,
-                raw_dataset,
-                best_metric if accelerator.is_main_process else None,  # type: ignore
-                full_pipeline_save_folder,
-                repo,
+
+        elif args.fine_tune_with_paired_dataset_mode == "sample":
+
+            global_step, best_metric, loss_value = perform_sample_prediction_for_paired_training(
+                    num_update_steps_per_epoch=num_update_steps_per_epoch,
+                    accelerator=accelerator,
+                    pipeline=pipeline,
+                    ema_models=ema_models,
+                    components_to_train_transcribed=components_to_train_transcribed,
+                    epoch=epoch,
+                    dataloader=paired_dataloader,
+                    args=args,
+                    first_epoch=first_epoch,
+                    resume_step=resume_step,
+                    global_step=global_step,
+                    optimizer=optimizer,
+                    lr_scheduler=lr_scheduler,
+                    logger=logger,
+                    params_to_clip=params_to_optimize,
+                    tot_training_steps=tot_training_steps,
+                    image_generation_tmp_save_folder=image_generation_tmp_save_folder,
+                    fidelity_cache_root=fidelity_cache_root,
+                    actual_eval_batch_sizes_for_this_process=actual_eval_batch_sizes_for_this_process,
+                    nb_classes=nb_classes,
+                    dataset=dataset,
+                    raw_dataset=raw_dataset,
+                    full_pipeline_save_folder=full_pipeline_save_folder,
+                    repo=repo,
+                    best_metric=best_metric if accelerator.is_main_process else None,  # type: ignore
+                    chckpt_save_path=chckpt_save_path,
+                )
+
+        elif args.fine_tune_with_paired_dataset_mode == "translation":
+            epoch_timer.start(global_step)
+            global_step, best_metric, loss_value = perform_class_transfer_for_paired_training(
+                num_update_steps_per_epoch=num_update_steps_per_epoch,
+                accelerator=accelerator,
+                pipeline=pipeline,
+                ema_models=ema_models,
+                components_to_train_transcribed=components_to_train_transcribed,
+                epoch=epoch,
+                dataloader=paired_dataloader,
+                args=args,
+                first_epoch=first_epoch,
+                resume_step=resume_step,
+                global_step=global_step,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                logger=logger,
+                params_to_clip=params_to_optimize,
+                tot_training_steps=tot_training_steps,
+                image_generation_tmp_save_folder=image_generation_tmp_save_folder,
+                fidelity_cache_root=fidelity_cache_root,
+                actual_eval_batch_sizes_for_this_process=actual_eval_batch_sizes_for_this_process,
+                nb_classes=nb_classes,
+                full_pipeline_save_folder=full_pipeline_save_folder,
+                repo=repo,
+                best_metric=best_metric if accelerator.is_main_process else None,  # type: ignore
+                chckpt_save_path=chckpt_save_path,
+            )
+            epoch_timer.end(global_step, accelerator)
+
+        if not args.fine_tune_with_paired_dataset_mode:
+        # Generate sample images for visual inspection & metrics computation
+            if args.eval_save_model_every_epochs is not None and (
+                epoch % args.eval_save_model_every_epochs == 0
+                or (
+                    args.precise_first_n_epochs is not None
+                    and epoch < args.precise_first_n_epochs
+                )
+            ):
+                best_metric = generate_samples_compute_metrics_save_pipe(
+                    args,
+                    accelerator,
+                    pipeline,
+                    image_generation_tmp_save_folder,
+                    fidelity_cache_root,
+                    actual_eval_batch_sizes_for_this_process,
+                    epoch,
+                    global_step,
+                    ema_models,
+                    components_to_train_transcribed,
+                    nb_classes,
+                    logger,
+                    dataset,
+                    raw_dataset,
+                    best_metric if accelerator.is_main_process else None,  # type: ignore
+                    full_pipeline_save_folder,
+                    repo,
+                )
+        else:
+            logger.info("Evaluation on test set...")
+            do_visual_inspection = True if global_step - last_global_step_of_test_visual_inspection > visual_inspection_interval else False
+            if do_visual_inspection:
+                last_global_step_of_test_visual_inspection = global_step
+            test_metrics = evaluate_paired_dataset(
+                num_update_steps_per_epoch=num_update_steps_per_epoch,
+                accelerator=accelerator,
+                pipeline=pipeline,
+                epoch=epoch,
+                dataloader=test_dataloader,
+                split="test",
+                args=args,
+                global_step=global_step,
+                lr_scheduler=lr_scheduler,
+                logger=logger,
+                is_initial_benchmark=False,
+                do_visual_inspection=do_visual_inspection,
             )
 
         # do not start new epoch before generation & pipeline saving is done

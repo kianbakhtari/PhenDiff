@@ -19,11 +19,13 @@ from argparse import Namespace
 from inspect import signature
 from math import ceil
 from pathlib import Path
+import time
 from shutil import rmtree
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch import nn
 import torch_fidelity
 from accelerate import Accelerator
 from accelerate.logging import MultiProcessAdapter
@@ -52,6 +54,10 @@ from .utils_misc import (
     split,
 )
 from .utils_models import SupportedPipelines
+from .utils_Img2Img import (
+    _ddib_for_training,
+    _ddibـfor_testing_during_training
+)
 
 
 def resume_from_checkpoint(
@@ -85,6 +91,7 @@ def resume_from_checkpoint(
         first_epoch, resume_step = 0, 0
     else:
         logger.info(f"Resuming from checkpoint {path}")
+        print(logger.info(f"\nResuming from checkpoint {path}\n"))
         accelerator.load_state(path)
         global_step = int(path.split("_")[-1])
 
@@ -180,12 +187,12 @@ def perform_training_epoch(
     repo,
     best_metric,
     chckpt_save_path: Path,
+    paired_dataloader: DataLoader = None
 ) -> tuple[int, float | None]:
     # 1. Retrieve models & set then to train mode if applicable
     # components common to all models
     denoiser_model = pipeline.unet
     denoiser_model.train()
-
     noise_scheduler = pipeline.scheduler
 
     # components specific to SD
@@ -194,21 +201,18 @@ def perform_training_epoch(
         autoencoder_model.train()
         # unwrap the autoencoder before calling it
         autoencoder_model = accelerator.unwrap_model(autoencoder_model)
-
         class_embedding = pipeline.class_embedding
         class_embedding.train()
     else:
         autoencoder_model = None
         class_embedding = None
 
-    # 2. Give me a pretty progress bar 🤩
     progress_bar = tqdm(
         total=num_update_steps_per_epoch,
         disable=not accelerator.is_local_main_process,
     )
     progress_bar.set_description(f"Epoch {epoch}")
 
-    # 3. Iterate over all batches
     for step, batch in enumerate(train_dataloader):
         # stop at tot_training_steps
         if global_step >= tot_training_steps:
@@ -260,7 +264,7 @@ def perform_training_epoch(
         # between all the processes to circumvent a nasty and unexplained bug...
         # fill tensor on main proc
         if accelerator.is_main_process:
-            # always true if proba_uncond == 1 as torch.rand -> [0;1[
+            # always true if proba_uncond == 1 as torch.rand -> [0;1]
             do_uncond_pass_across_all_procs = (
                 torch.tensor(1, device=accelerator.device)
                 if torch.rand(1) < args.proba_uncond
@@ -268,6 +272,7 @@ def perform_training_epoch(
             )
         else:
             do_uncond_pass_across_all_procs = torch.tensor(0, device=accelerator.device)
+            
         accelerator.wait_for_everyone()
         # broadcast tensor to all procs
         do_uncond_pass_across_all_procs = broadcast(do_uncond_pass_across_all_procs)
@@ -368,6 +373,403 @@ def perform_training_epoch(
     return global_step, best_metric
 
 
+def paired_dataset_visual_inspection_and_log(
+        accelerator: Accelerator,
+        global_step: int,
+        source_images: torch.tensor,
+        target_images: torch.tensor,
+        translated_images: torch.tensor,
+        split: str
+):
+    def process(tensor: torch.tensor) -> np.ndarray:
+            return tensor.detach()[:10].permute(0, 2, 3, 1).cpu().numpy()
+
+    if accelerator.is_main_process:
+        source_images_processed_for_logging = process(source_images)
+        target_images_processed_for_logging = process(target_images)
+        translated_images_processed_for_logging = process(translated_images)
+
+        source_images_to_log = [
+            wandb.Image(
+                source_images_processed_for_logging[i],
+                caption=f"{split} - source image {i}",
+            )
+            for i in range(len(source_images_processed_for_logging))
+        ]
+
+        target_images_to_log = [
+            wandb.Image(
+                target_images_processed_for_logging[i],
+                caption=f"{split} - target image {i}",
+            )
+            for i in range(len(target_images_processed_for_logging))
+        ]
+
+        translated_images_to_log = [
+            wandb.Image(
+                translated_images_processed_for_logging[i],
+                caption=f"{split} - translated image {i}",
+            )
+            for i in range(len(translated_images_processed_for_logging))
+        ]
+        
+        data_to_log = [
+            [src, tar, trans] for src, tar, trans in zip(
+                source_images_to_log,
+                target_images_to_log,
+                translated_images_to_log
+            )
+        ]
+        table = wandb.Table(
+            ["source images", "target images", "translated images"],
+            data_to_log,
+        )
+
+        accelerator.log(
+            {
+                f"{split} data samples - gs: {global_step}": table
+            },
+            step=global_step
+        )
+
+
+def perform_class_transfer_for_paired_training(
+    num_update_steps_per_epoch: int,
+    accelerator: Accelerator,
+    pipeline: ConditionalDDIMPipeline,
+    ema_models: dict[str, EMAModel],
+    components_to_train_transcribed: list[str],
+    epoch: int,
+    dataloader: DataLoader,
+    args: Namespace,
+    first_epoch: int,
+    resume_step: int,
+    global_step: int,
+    optimizer,
+    lr_scheduler,
+    logger: MultiProcessAdapter,
+    params_to_clip: list,
+    tot_training_steps: int,
+    image_generation_tmp_save_folder: Path,
+    fidelity_cache_root: Path,
+    actual_eval_batch_sizes_for_this_process: list[int],
+    nb_classes: int,
+    full_pipeline_save_folder: Path,
+    repo,
+    best_metric,
+    chckpt_save_path: Path,
+) -> tuple[int, float | None]:
+    
+    def make_tensor_binary(tensor: torch.Tensor) -> torch.Tensor:
+        # The input tensor should be centered around 0
+        tensor = torch.sigmoid(tensor)
+        tensor = torch.round(tensor)
+        assert torch.all((tensor == 0) | (tensor == 1)), "tensor should be binary."
+        return tensor
+        
+    pipe = pipeline
+    denoiser_model = pipeline.unet
+    denoiser_model.train()
+    num_inference_steps = 30
+    # ----------- Distributed inference & device placement ----------- #
+    dataloader = accelerator.prepare(dataloader)
+    # pipe = pipe.to(accelerator.device)
+
+    # ----------- Creat save directories ----------- #
+    accelerator.wait_for_everyone()
+
+    progress_bar = tqdm(
+        total=num_update_steps_per_epoch,
+        disable=not accelerator.is_local_main_process,
+    )
+    progress_bar.set_description(f"Epoch {epoch}")
+    
+    # ----------- Iterate Over Batches ----------- #
+    do_visual_inspection_and_log = False
+
+    sources_accu = []
+    targets_accu = []
+    translateds_accu = []
+
+    for step, batch in enumerate(
+        tqdm(
+            dataloader,
+            desc=f"Running paired translation for training, iterating over batches...",
+            position=0,
+        )
+    ):  
+        source_images = batch["source_images"].to(accelerator.device)
+        source_labels = batch["source_class"].to(accelerator.device)
+        target_images = batch["target_images"].to(accelerator.device)
+        target_labels = batch["target_class"].to(accelerator.device)
+
+        orig_class_labels = source_labels
+        target_class_labels = 1 - orig_class_labels
+        assert torch.equal(target_class_labels, target_labels), "target_class_labels and target_labels should be the same."
+
+        translated_images = _ddib_for_training(
+            pipe,
+            source_images, # [bs, ch, 128, 128]
+            orig_class_labels, # [bs] --> [1, 1, 1, 1, 1, 1, ...]
+            target_class_labels,
+            num_inference_steps,
+            process_idx=accelerator.process_index
+        )
+
+        if torch.isnan(translated_images).any():
+            msg = "NaN values found in translated_images!"
+            logger.warn(f"\n{msg}")
+            accelerator.log({'warning': msg})
+        if torch.isinf(translated_images).any():
+            msg = "Inf values found in translated_images!"
+            logger.warn(f"\n{msg}")
+            accelerator.log({'warning': msg})
+
+        clampped_translated_images = torch.clamp(translated_images, -1, 1)
+        mse_loss = F.mse_loss(clampped_translated_images, target_images)
+        bce_loss_value, dice = None, None # Default
+
+        if args.paired_training_loss.lower().strip() == "bce":
+            assert all(value in [-1, 1] for value in target_images.unique()), "target_images should be binary in {-1, 1}"
+            target_images = make_tensor_binary(target_images) # Going from {-1, 1} to {0, 1}
+            num_positive = (target_images == 1).sum().item()
+            num_negative = (target_images == 0).sum().item()
+            pos_weight = torch.tensor([num_negative / (num_positive + 1e-3)], dtype=torch.float32).to(accelerator.device)
+            bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)(translated_images, target_images)
+            accelerator.backward(bce_loss)
+            loss_value, bce_loss_value = bce_loss, bce_loss.item()
+
+            translated_images = make_tensor_binary(translated_images)
+            dice = dice_score(pred=translated_images, target=target_images)
+        else:
+            accelerator.backward(mse_loss)
+            loss_value = mse_loss
+
+        optimizer.step()
+        lr_scheduler.step()
+        optimizer.zero_grad()
+
+        if len(sources_accu) < 20:
+            sources_accu.append(source_images)
+            targets_accu.append(target_images)
+            translateds_accu.append(translated_images)
+
+        # Checks if the accelerator has performed an optimization step behind the scenes
+        if accelerator.sync_gradients:
+            global_step = _syn_training_state(
+                args=args,
+                pipeline=pipeline,
+                components_to_train_transcribed=components_to_train_transcribed,
+                ema_models=ema_models,
+                progress_bar=progress_bar,
+                global_step=global_step,
+                accelerator=accelerator,
+                logger=logger,
+                chckpt_save_path=chckpt_save_path,
+            )
+
+        logs = {
+            "train_bce": bce_loss_value,
+            "train_mse": mse_loss,
+            "train_dice": dice,
+            "lr": lr_scheduler.get_last_lr()[0],
+            "step": global_step,
+            "epoch": epoch,
+        }
+
+        if args.use_ema:
+            logs["ema_decay"] = list(ema_models.values())[0].cur_decay_value
+
+        # progress_bar.set_postfix(**logs)
+        accelerator.log(logs, step=global_step)
+
+        if math.isnan(loss_value) and accelerator.is_main_process:
+            msg = f"Loss is NaN at step {global_step} / epoch {epoch}"
+            wandb.alert(
+                title="NaN loss",
+                text=msg,
+                level=wandb.AlertLevel.ERROR,
+                wait_duration=21600,  # 6 hours
+            )
+            logger.error(msg)
+
+        if global_step % 250 == 0:
+            do_visual_inspection_and_log = True
+
+    progress_bar.close()
+
+    if do_visual_inspection_and_log:
+        print("Visual evaluation on train set...")
+        paired_dataset_visual_inspection_and_log(
+            accelerator=accelerator,
+            global_step=global_step,
+            source_images=torch.cat(sources_accu, dim=0),
+            target_images=torch.cat(targets_accu, dim=0),
+            translated_images=torch.cat(translateds_accu, dim=0),
+            split="train"
+        )
+    
+    accelerator.wait_for_everyone()
+    return global_step, best_metric, loss_value
+
+
+def perform_sample_prediction_for_paired_training(
+    num_update_steps_per_epoch: int,
+    accelerator: Accelerator,
+    pipeline: SupportedPipelines,
+    ema_models: dict[str, EMAModel],
+    components_to_train_transcribed: list[str],
+    epoch: int,
+    dataloader: DataLoader,
+    args: Namespace,
+    first_epoch: int,
+    resume_step: int,
+    global_step: int,
+    optimizer,
+    lr_scheduler,
+    logger: MultiProcessAdapter,
+    params_to_clip: list,
+    tot_training_steps: int,
+    image_generation_tmp_save_folder: Path,
+    fidelity_cache_root: Path,
+    actual_eval_batch_sizes_for_this_process: list[int],
+    nb_classes: int,
+    dataset,
+    raw_dataset,
+    full_pipeline_save_folder: Path,
+    repo,
+    best_metric,
+    chckpt_save_path: Path,
+) -> tuple[int, float | None]:
+    
+    denoiser_model = pipeline.unet
+    denoiser_model.train()
+    noise_scheduler = pipeline.scheduler
+    
+    autoencoder_model = None
+    class_embedding = None
+
+    progress_bar = tqdm(
+        total=num_update_steps_per_epoch,
+        disable=not accelerator.is_local_main_process,
+    )
+    progress_bar.set_description(f"Epoch {epoch} - In Sample Prediction For Paired Training")
+
+    for step, batch in enumerate(dataloader):
+        if global_step >= tot_training_steps:
+            break
+
+        # Skip steps until we reach the resumed step
+        # if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
+        #     if step % args.gradient_accumulation_steps == 0:
+        #         progress_bar.update()
+        #     continue
+
+        source_images = batch["source_images"].to(accelerator.device)
+        source_classes = batch["source_class"].to(accelerator.device)
+        target_images = batch["target_images"].to(accelerator.device)
+        target_classes = batch["target_class"].to(accelerator.device)
+
+        noise: FloatTensor = torch.randn(source_images.shape).to(source_images.device)  # type: ignore
+
+        
+        timesteps: IntTensor = torch.randint(  # type: ignore
+            0,
+            noise_scheduler.config.num_train_timesteps,
+            (source_images.shape[0],),
+            device=source_images.device,
+        ).long()
+        
+        noisy_source_images = noise_scheduler.add_noise(source_images, noise, timesteps)
+
+        loss_value = _diffusion_and_backward_for_paired_sample_prediction(
+            args=args,
+            accelerator=accelerator,
+            global_step=global_step,
+            denoiser_model=denoiser_model,
+            timesteps=timesteps,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            class_embedding=class_embedding,
+            logger=logger,
+            params_to_clip=params_to_clip,
+            noise_scheduler=noise_scheduler,
+            noise=noise,
+            noisy_source_images=noisy_source_images,
+            clean_source_images=source_images,
+            target_images=target_images,
+            source_classes=source_classes,
+            target_classes=target_classes,
+        )
+
+        # Checks if the accelerator has performed an optimization step behind the scenes
+        if accelerator.sync_gradients:
+            global_step = _syn_training_state(
+                args=args,
+                pipeline=pipeline,
+                components_to_train_transcribed=components_to_train_transcribed,
+                ema_models=ema_models,
+                progress_bar=progress_bar,
+                global_step=global_step,
+                accelerator=accelerator,
+                logger=logger,
+                chckpt_save_path=chckpt_save_path,
+            )
+
+        # log some values & define W&B alert
+        logs = {
+            "loss": loss_value,
+            "lr": lr_scheduler.get_last_lr()[0],
+            "step": global_step,
+            "epoch": epoch,
+        }
+        if args.use_ema:
+            logs["ema_decay"] = list(ema_models.values())[0].cur_decay_value
+        progress_bar.set_postfix(**logs)
+        accelerator.log(logs, step=global_step)
+        if math.isnan(loss_value) and accelerator.is_main_process:
+            msg = f"Loss is NaN at step {global_step} / epoch {epoch}"
+            wandb.alert(
+                title="NaN loss",
+                text=msg,
+                level=wandb.AlertLevel.ERROR,
+                wait_duration=21600,  # 6 hours
+            )
+            logger.error(msg)
+
+        # Generate sample images for visual inspection & metrics computation
+        if (
+            args.eval_save_model_every_opti_steps is not None
+            and global_step % args.eval_save_model_every_opti_steps == 0
+        ):
+            best_metric = generate_samples_compute_metrics_save_pipe(
+                args,
+                accelerator,
+                pipeline,
+                image_generation_tmp_save_folder,
+                fidelity_cache_root,
+                actual_eval_batch_sizes_for_this_process,
+                epoch,
+                global_step,
+                ema_models,
+                components_to_train_transcribed,
+                nb_classes,
+                logger,
+                dataset,
+                raw_dataset,
+                best_metric,
+                full_pipeline_save_folder,
+                repo,
+            )
+
+    progress_bar.close()
+
+    # wait for everybody at end of each training epoch
+    accelerator.wait_for_everyone()
+
+    return global_step, best_metric, loss_value
+
+
 def _diffusion_and_backward(
     args: Namespace,
     accelerator: Accelerator,
@@ -427,6 +829,7 @@ def _diffusion_and_backward(
             )  # use SNR weighting from distillation paper
             loss = loss.mean()
         case "v_prediction":
+            # Kian: our case.
             velocity = noise_scheduler.get_velocity(clean_images, noise, timesteps)
             loss = F.mse_loss(model_output, velocity)
         case _:
@@ -449,6 +852,107 @@ def _diffusion_and_backward(
             logger.error(msg)
 
     # 4. Perform optimization step
+    optimizer.step()
+    lr_scheduler.step()
+    optimizer.zero_grad()
+
+    return loss.item()
+
+
+def _diffusion_and_backward_for_paired_sample_prediction(
+    args: Namespace,
+    accelerator: Accelerator,
+    global_step: int,
+    denoiser_model: UNet2DConditionModel | CustomCondUNet2DModel,
+    timesteps: IntTensor,
+    lr_scheduler,
+    optimizer,
+    class_embedding: CustomEmbedding | None,
+    logger: MultiProcessAdapter,
+    params_to_clip: list,
+    noise_scheduler: DDIMScheduler,
+    noise: FloatTensor,
+    noisy_source_images: FloatTensor,
+    clean_source_images: FloatTensor,
+    target_images: FloatTensor,
+    source_classes: torch.Tensor,
+    target_classes: torch.Tensor
+) -> float:
+    """
+    This is a modified version of _diffusion_and_backward
+    function specifically for performing diffusion and backward
+    on the paired dataset, if provided.
+    """
+
+    def predict_x0_from_noisy_sample(
+        ddim_sheduler: DDIMScheduler,
+        noisy_samples: torch.Tensor,
+        predicted_noise: torch.Tensor,
+        timesteps: torch.IntTensor,
+    ) -> torch.Tensor:
+        """
+        This function is intended to be the reverse of add_noise function of our DDIMscheduler
+        see: https://github.com/huggingface/diffusers/blob/main/src/diffusers/schedulers/scheduling_ddim.py#L471
+        """
+
+        alphas_cumprod = ddim_sheduler.alphas_cumprod.to(device=noisy_samples.device)
+        # alphas_cumprod = ddim_sheduler.alphas_cumprod.to(dtype=noisy_samples.dtype)
+        timesteps = timesteps.to(noisy_samples.device)
+        predicted_noise = predicted_noise.to(noisy_samples.device)
+
+        sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
+        sqrt_alpha_prod = sqrt_alpha_prod.flatten()
+        while len(sqrt_alpha_prod.shape) < len(noisy_samples.shape):
+            sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+
+        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
+        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
+        while len(sqrt_one_minus_alpha_prod.shape) < len(noisy_samples.shape):
+            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+
+        estimation_of_x0 = (noisy_samples - (sqrt_one_minus_alpha_prod * predicted_noise)) / sqrt_alpha_prod
+        return estimation_of_x0
+
+
+    match args.model_type:
+        case "StableDiffusion":
+            raise NotImplementedError()
+        case "DDIM":
+            model_output = _DDIM_prediction_wrapper(
+                accelerator=accelerator,
+                do_unconditional_pass=False,
+                class_labels=target_classes,
+                denoiser_model=denoiser_model,
+                noisy_images=noisy_source_images,
+                timesteps=timesteps,
+            )
+        case _:
+            raise ValueError(f"Unsupported model type: {args.model_type}")
+    
+    predicted_x0 = predict_x0_from_noisy_sample(
+        ddim_sheduler=noise_scheduler,
+        noisy_samples=noisy_source_images,
+        predicted_noise=model_output,
+        timesteps=timesteps
+    )
+
+    loss = F.mse_loss(predicted_x0, target_images)
+    loss = loss.mean()
+    accelerator.backward(loss)
+
+    if accelerator.sync_gradients:
+        gard_norm = accelerator.clip_grad_norm_(params_to_clip, 1.0)
+        accelerator.log({"gradient norm": gard_norm}, step=global_step)
+        if gard_norm.isnan().any() and accelerator.is_main_process:  # type: ignore
+            msg = f"Gradient norm is NaN at step {global_step}"
+            wandb.alert(
+                title="NaN gradient norm",
+                text=msg,
+                level=wandb.AlertLevel.ERROR,
+                wait_duration=21600,  # 6 hours
+            )
+            logger.error(msg)
+
     optimizer.step()
     lr_scheduler.step()
     optimizer.zero_grad()
@@ -902,10 +1406,12 @@ def _generate_save_images_for_this_class_DDIM(
                 (actual_bs,), class_label, device=pipeline.device
             ).long()
             class_emb = None
+        
         images = pipeline(
-            class_labels,
-            class_emb,
-            args.guidance_factor,
+            for_testing=True, # Kian: if we are here during unpaired training, this value doesn't have any effect since _original_no_grad_call will be called
+            class_labels=class_labels,
+            class_emb=class_emb,
+            w=args.guidance_factor,
             generator=generator,
             num_inference_steps=args.num_inference_steps,
             output_type="numpy",
@@ -1059,3 +1565,237 @@ def save_pipeline(
 
     if args.push_to_hub:
         repo.push_to_hub(commit_message=f"Epoch {epoch}", blocking=False)
+
+
+def setup_fine_tuning(args, chckpt_save_path, logger):
+    # if not args.fine_tune_experiment_by_paired_training.endswith("/"):
+    #     raise Exception(f"args.fine_tune_experiment_by_paired_training should end in /.")
+    if not chckpt_save_path.endswith("/"):
+        chckpt_save_path += "/"
+
+    if args.fine_tune_experiment_by_paired_training.endswith("/"):
+        checkpoint_dir_name = os.path.basename(args.fine_tune_experiment_by_paired_training[:-1])
+    else:
+        checkpoint_dir_name = os.path.basename(args.fine_tune_experiment_by_paired_training)
+    
+    # print("\n#####")
+    # print(args.fine_tune_experiment_by_paired_training)
+    # print(chckpt_save_path)
+    # print("#####\n")
+
+    if not os.path.isdir(chckpt_save_path):
+        raise Exception("os.path.isdir(chckpt_save_path) is false")
+    if not os.path.isdir(args.fine_tune_experiment_by_paired_training):
+        raise Exception("os.path.isdir(args.fine_tune_experiment_by_paired_training) is false")
+
+    cmd = f"cp -r {args.fine_tune_experiment_by_paired_training} {chckpt_save_path}"
+    
+    print("CMD:\n", cmd)
+
+    exc_code = os.system(cmd)
+    if exc_code != 0:
+        raise Exception(f"exit code {exc_code} for command: {cmd}")
+
+    logger.info(
+        f"Pre-trained checkpoint coppied:\nFrom: {args.fine_tune_experiment_by_paired_training}\nTo: {chckpt_save_path}\n"
+    )
+    print(f"Pre-trained checkpoint coppied:\nFrom: {args.fine_tune_experiment_by_paired_training}\nTo: {chckpt_save_path}\n")
+
+    args.resume_from_checkpoint = checkpoint_dir_name
+
+    logger.info(
+        f"args.resume_from_checkpoint is updated: {args.resume_from_checkpoint}"
+    )
+    print(f"args.resume_from_checkpoint is updated: {args.resume_from_checkpoint}")
+
+
+def dice_score(pred: torch.Tensor, target: torch.Tensor) -> float:
+    assert pred.shape == target.shape, "pred and target should have the same shape."
+    assert torch.all((pred == 0) | (pred == 1)), "pred should have values 0 or 1."
+    assert torch.all((target == 0) | (target == 1)), "target should have values 0 or 1."
+    
+    pred_flat = pred.view(pred.size(0), pred.size(1), -1)
+    target_flat = target.view(target.size(0), target.size(1), -1)
+    
+    intersection = torch.sum(pred_flat * target_flat, dim=2)
+    pred_sum = torch.sum(pred_flat, dim=2)
+    target_sum = torch.sum(target_flat, dim=2)
+
+    dice = (2 * intersection) / (pred_sum + target_sum + 1e-8)
+    return dice.mean().item()
+
+
+def evaluate_paired_dataset(
+    num_update_steps_per_epoch: int,
+    accelerator: Accelerator,
+    pipeline: ConditionalDDIMPipeline,
+    epoch: int,
+    dataloader: DataLoader,
+    split: str,
+    args: Namespace,
+    global_step: int,
+    lr_scheduler,
+    logger: MultiProcessAdapter,
+    is_initial_benchmark: bool,
+    do_visual_inspection: bool,
+   
+) -> tuple[int, float | None]:
+    
+    assert split in ["train", "test"], f"split should be train or test, not {split}"
+
+    def make_tensor_binary(tensor: torch.Tensor) -> torch.Tensor:
+        # The input tensor should be centered around 0
+        tensor = torch.sigmoid(tensor)
+        tensor = torch.round(tensor)
+        assert torch.all((tensor == 0) | (tensor == 1)), "tensor should be binary."
+        return tensor
+
+    pipe = pipeline
+    denoiser_model = pipeline.unet
+    denoiser_model.eval()
+    num_inference_steps = 30
+
+    dataloader = accelerator.prepare(dataloader)
+    # pipe = pipe.to(accelerator.device)
+    accelerator.wait_for_everyone()
+
+    progress_bar = tqdm(
+        total=num_update_steps_per_epoch,
+        disable=not accelerator.is_local_main_process,
+    )
+    progress_bar.set_description(f"evaluate_paired_dataset on epoch {epoch}")
+    
+    # ----------- Iterate Over Batches ----------- #
+    mse_all, bce_all, dice_all = [], [], []
+    sources_accu = []
+    targets_accu = []
+    translateds_accu = []
+    
+    for step, batch in enumerate(
+        tqdm(
+            dataloader,
+            desc=f"evaluate_paired_dataset on {split} set...",
+            position=0,
+        )
+    ):
+        
+        source_images = batch["source_images"].to(accelerator.device)
+        source_labels = batch["source_class"].to(accelerator.device)
+        target_images = batch["target_images"].to(accelerator.device)
+        target_labels = batch["target_class"].to(accelerator.device)
+
+        orig_class_labels = source_labels
+        target_class_labels = 1 - orig_class_labels
+        assert torch.equal(target_class_labels, target_labels), "target_class_labels and target_labels should be the same."
+
+        with torch.no_grad():
+            translated_images = _ddibـfor_testing_during_training(
+                pipe,
+                source_images, # [bs, 1, 128, 128]
+                orig_class_labels, # [bs] --> [1, 1, 1, 1, 1, 1, ...]
+                target_class_labels,
+                num_inference_steps,
+                process_idx=accelerator.process_index
+            )
+
+            if torch.isnan(translated_images).any():
+                msg = "NaN values found in translated_images!"
+                logger.warn(f"\n{msg}")
+                accelerator.log({'warning': msg})
+            if torch.isinf(translated_images).any():
+                msg = "Inf values found in translated_images!"
+                logger.warn(f"\n{msg}")
+                accelerator.log({'warning': msg})
+
+            clampped_translated_images = torch.clamp(translated_images, -1, 1)
+            mse = F.mse_loss(clampped_translated_images, target_images)
+            mse_all.append(mse.cpu().item())
+            bce, dice = None, None # Default
+
+            if args.paired_training_loss.lower().strip() == "bce":
+                assert all(value in [-1, 1] for value in target_images.unique()), "target_images should be binary in {-1, 1}"
+                target_images = make_tensor_binary(target_images) # Going from {-1, 1} to {0, 1}
+                num_positive = (target_images == 1).sum().item()
+                num_negative = (target_images == 0).sum().item()
+                pos_weight = num_negative / (num_positive + 1e-3)
+                bce = F.binary_cross_entropy_with_logits(
+                    translated_images, target_images, pos_weight=torch.tensor(pos_weight).to(accelerator.device)
+                )
+                translated_images = make_tensor_binary(translated_images)
+                dice = dice_score(pred=translated_images, target=target_images)
+
+                bce_all.append(bce.cpu().item())
+                dice_all.append(dice)
+
+            if len(sources_accu) < 20:
+                sources_accu.append(source_images)
+                targets_accu.append(target_images)
+                translateds_accu.append(translated_images)
+            
+    if is_initial_benchmark:
+        logs = {
+            f"benchmark_{split}_mse": np.array(mse_all).mean(),
+            f"benchmark_{split}_bce": np.array(bce_all).mean(),
+            f"benchmark_{split}_dice": np.array(dice_all).mean(),
+            "lr": lr_scheduler.get_last_lr()[0],
+            "step": global_step,
+            "epoch": epoch,
+        }
+    else:
+        logs = {
+            f"{split}_mse": np.array(mse_all).mean(),
+            f"{split}_bce": np.array(bce_all).mean(),
+            f"{split}_dice": np.array(dice_all).mean(),
+            "lr": lr_scheduler.get_last_lr()[0],
+            "step": global_step,
+            "epoch": epoch,
+        }
+
+    accelerator.log(logs, step=global_step)
+    accelerator.wait_for_everyone()
+
+    if do_visual_inspection:
+        paired_dataset_visual_inspection_and_log(
+            accelerator=accelerator,
+            global_step=global_step,
+            source_images=torch.cat(sources_accu, dim=0),
+            target_images=torch.cat(targets_accu, dim=0),
+            translated_images=torch.cat(translateds_accu, dim=0),
+            split=split
+        )
+    return logs
+
+
+class EpochTimer:
+    def __init__(self):
+        self.start_time = None
+        self.start_gs = None
+        self.end_time = None
+        self.end_gs = None
+
+    def start(self, global_step):
+        self.start_time = time.time()
+        self.start_gs = global_step
+        self.end_time = None
+        self.end_gs = None
+
+    def end(self, global_step, accelerator):
+        self.end_time = time.time()
+        self.end_gs = global_step
+        epoch_elapsed_time_mins = round((self.end_time - self.start_time) / 60, 2)
+        epoch_elapsed_steps = self.end_gs - self.start_gs
+        step_elapsed_time_secs = round((self.end_time - self.start_time) / epoch_elapsed_steps, 2)
+        accelerator.log(
+            {
+                "epoch_elapsed_time_mins": epoch_elapsed_time_mins,
+                "step_elapsed_time_secs": step_elapsed_time_secs,
+            },
+            step=self.end_gs,
+        )
+        
+
+
+
+    
+
+    

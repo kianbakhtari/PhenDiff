@@ -16,6 +16,11 @@ import random
 from argparse import Namespace
 from pathlib import Path
 from typing import Optional
+import os
+import glob
+from PIL import Image
+from io import BytesIO
+from typing import Literal, Optional, Tuple, Union, List, Dict, Any
 
 import torch
 from accelerate.logging import MultiProcessAdapter
@@ -23,6 +28,8 @@ from datasets import load_dataset
 from torch.utils.data import Dataset, Subset
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
+from torchvision.transforms import functional as F
+from torchvision.io import read_image
 
 
 class NoLabelsDataset(ImageFolder):
@@ -47,6 +54,130 @@ class NoLabelsDataset(ImageFolder):
         return sample
 
 
+class JointTransforms:
+    """A custom image transformation and data augmentation class for paired samples."""
+    def __init__(self, args, h_flip_prob=0.5, v_flip_prob=0.5):
+        self.h_flip_prob = h_flip_prob
+        self.v_flip_prob = v_flip_prob
+
+        if isinstance(args.definition, int):
+            (h, w) = (args.definition, args.definition)
+        else:
+            (h, w) = args.definition
+
+        self.default_transforms = transforms.Compose([
+            transforms.Resize((h, w), interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),  # map to [-1, 1] for SiLU
+        ])
+
+    def __call__(self, imgA, imgB):
+
+        imgA = self.default_transforms(imgA)
+        imgB = self.default_transforms(imgB)
+
+        if random.random() < self.h_flip_prob:
+            imgA = F.hflip(imgA)
+            imgB = F.hflip(imgB)
+
+        if random.random() < self.v_flip_prob:
+            imgA = F.vflip(imgA)
+            imgB = F.vflip(imgB)
+
+        return imgA, imgB
+    
+
+class PairedSamplesDataset(Dataset):
+    """A custom dataset that outputs paired samples.
+    Data should be organized in this way:
+        /root
+            /class_A
+                img1.png
+                img2.png
+                ...
+            /class_B
+                img1.png
+                img2.png
+        ...
+    root: root directory for the paired dataset (should have the classes under itself like the illustration above)
+    source_class: for one-way translation tasks involving source and target classes, like segmentation.
+    """
+
+    def __init__(self, args, root : str, source_class : Optional[str] = None, transform: JointTransforms = None):
+        root = os.path.abspath(root)
+        class_directories = glob.glob(os.path.join(root, '*'))
+        assert len(class_directories) == 2, f"There sould be two and only two classes under the root: {root} , found: {class_directories}"
+
+        if not all([os.path.isdir(d) for d in class_directories]):
+            raise Exception(f"There should be only directories under the root: {root}")
+        
+        classA_dir, classB_dir = class_directories
+        assert classA_dir != classB_dir, f"Two classes should be different: {classA_dir}, {classB_dir}"
+        assert sorted(os.listdir(classA_dir)) == sorted(os.listdir(classB_dir)), "Paired data should be organazied in the way described above,\
+        with samples having identical names under two classes."
+
+        self.classes, self.class_to_idx = self.find_classes(root)
+
+        self.classA_dir = os.path.join(root, self.classes[0]) # A -> 0
+        self.classB_dir = os.path.join(root, self.classes[1]) # B -> 1
+        self.images = sorted(os.listdir(self.classA_dir))
+        self.transform = transform
+        self.source_class = source_class
+        if self.source_class is not None:
+            assert self.source_class in self.classes, f"source_class {source_class} incompatible with classes: {self.classes}"
+        
+        self.convert_to_rgb = True
+        if args.denoiser_in_channels == 1:
+            self.convert_to_rgb = False
+
+    def find_classes(self, directory: Union[str, Path]) -> Tuple[List[str], Dict[str, int]]:
+        """Finds the class folders in a dataset.
+        Borrowed from PyTorch: https://pytorch.org/vision/main/_modules/torchvision/datasets/folder.html#ImageFolder
+        See :class:`DatasetFolder` for details.
+        We use this function to find the class indicies because the ImageFolder (which is handling the unpaired dataset) is using this function internally.
+        """
+        classes = sorted(entry.name for entry in os.scandir(directory) if entry.is_dir())
+        if not classes:
+            raise FileNotFoundError(f"Couldn't find any class folder in {directory}.")
+
+        class_to_idx = {cls_name: i for i, cls_name in enumerate(classes)}
+        return classes, class_to_idx
+        
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        imgA_path = os.path.join(self.classA_dir, self.images[idx])
+        imgB_path = os.path.join(self.classB_dir, self.images[idx])
+
+        if self.convert_to_rgb:
+            imgA = Image.open(imgA_path).convert("RGB")
+            imgB = Image.open(imgB_path).convert("RGB")
+        else:
+            imgA = Image.open(imgA_path)
+            imgB = Image.open(imgB_path)
+        
+        if self.transform is not None:
+            imgA, imgB = self.transform(imgA, imgB)
+        
+        # Always source class comes first
+        if self.source_class is not None:
+            if self.classes[1] == self.source_class:
+                return {
+                    "source_images": imgB,
+                    "source_class": self.class_to_idx[self.classes[1]],
+                    "target_images": imgA,
+                    "target_class": self.class_to_idx[self.classes[0]],
+                }
+            
+        return {
+                "source_images": imgA,
+                "source_class": self.class_to_idx[self.classes[0]],
+                "target_images": imgB,
+                "target_class": self.class_to_idx[self.classes[1]],
+            }
+
+
 def setup_dataset(
     args: Namespace, logger: MultiProcessAdapter
 ) -> tuple[ImageFolder | Subset, NoLabelsDataset | Subset, int]:
@@ -55,6 +186,40 @@ def setup_dataset(
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
+
+    #################################################
+    # def default_loader(path: str) -> Image.Image:
+    #     with open(path, "rb") as f:
+    #         img = Image.open(BytesIO(f.read()))
+    #         # img_array = np.array(img)
+    #         # print("\n\n\nPIl LOADER")
+    #         # print(img_array.shape)
+    #         return img
+
+    def pil_loader(path: str) -> Image.Image:
+        # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
+        with open(path, "rb") as f:
+            img = Image.open(BytesIO(f.read()))
+            return img
+
+    def accimage_loader(path: str) -> Any:
+        import accimage
+
+        try:
+            return accimage.Image(path)
+        except OSError:
+            # Potentially a decoding problem, fall back to PIL.Image
+            return pil_loader(path)
+
+    def default_loader(path: str) -> Any:
+        from torchvision import get_image_backend
+
+        if get_image_backend() == "accimage":
+            return accimage_loader(path)
+        else:
+            return pil_loader(path)
+    #################################################
+
     if args.dataset_name is not None:
         raise NotImplementedError("Not tested yet")
         dataset = load_dataset(
@@ -64,15 +229,28 @@ def setup_dataset(
             split="train",
         )
     elif args.use_pytorch_loader:
-        dataset: ImageFolder | Subset = ImageFolder(
-            root=Path(args.train_data_dir, args.split).as_posix(),
-            transform=lambda x: transformations(x.convert("RGB")),
-            target_transform=lambda y: torch.tensor(y).long(),
-        )
-        raw_dataset: NoLabelsDataset | Subset = NoLabelsDataset(
-            root=Path(args.train_data_dir, args.split).as_posix(),
-            transform=lambda x: raw_transformations(x.convert("RGB")),
-        )
+        if args.denoiser_in_channels == 1:
+            dataset: ImageFolder | Subset = ImageFolder(
+                root=Path(args.train_data_dir, args.split).as_posix(),
+                transform=lambda x: transformations(x),
+                target_transform=lambda y: torch.tensor(y).long(),
+                loader=default_loader,
+            )
+            raw_dataset: NoLabelsDataset | Subset = NoLabelsDataset(
+                root=Path(args.train_data_dir, args.split).as_posix(),
+                transform=lambda x: raw_transformations(x),
+                loader=default_loader,
+            )
+        else:
+            dataset: ImageFolder | Subset = ImageFolder(
+                root=Path(args.train_data_dir, args.split).as_posix(),
+                transform=lambda x: transformations(x),
+                target_transform=lambda y: torch.tensor(y).long(),
+            )
+            raw_dataset: NoLabelsDataset | Subset = NoLabelsDataset(
+                root=Path(args.train_data_dir, args.split).as_posix(),
+                transform=lambda x: raw_transformations(x),
+            )
         assert len(dataset) == len(
             raw_dataset
         ), "dataset and raw_dataset should have the same length"
@@ -110,7 +288,8 @@ def setup_dataset(
         transforms.ToTensor(),
         transforms.Normalize([0.5], [0.5]),  # map to [-1, 1] for SiLU
     ]
-    if args.data_aug_on_the_fly:
+    if args.data_aug_on_the_fly: # Kian: ture by default.
+        # Kian: There is a "no_data_aug_on_the_fly" arg in the arguments. We should put it in the args to disable augmentations.
         list_transforms += [
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(),
@@ -138,6 +317,30 @@ def setup_dataset(
     return dataset, raw_dataset, len(dataset.classes)
 
 
+def setup_paired_dataset(
+    args: Namespace, logger: MultiProcessAdapter, test_split:bool=False
+) -> PairedSamplesDataset:
+    
+    assert args.use_pytorch_loader, "You should use args.use_pytorch_loader for using paired samples"
+
+    if test_split:
+        test_dataset: PairedSamplesDataset = PairedSamplesDataset(
+        args,
+        root=Path(args.test_data_dir).as_posix(), 
+        source_class=args.source_class_for_paired_training,
+        transform=JointTransforms(args, h_flip_prob=0, v_flip_prob=0),
+        )
+        return test_dataset
+
+    paired_dataset: PairedSamplesDataset = PairedSamplesDataset(
+        args,
+        root=Path(args.paired_train_data_dir, args.split).as_posix(), # Kian: args.split is "train" by default.
+        source_class=args.source_class_for_paired_training,
+        transform=JointTransforms(args),
+    )
+    return paired_dataset
+
+
 def _select_subset_of_dataset(
     args: Namespace,
     full_dataset: ImageFolder,
@@ -153,6 +356,11 @@ def _select_subset_of_dataset(
         class_counts[label] += 1
 
     nb_classes = len(class_counts)
+
+    # print()
+    # print(f"list(class_counts.values()) --> {list(class_counts.values())}")
+    # print(f"[class_counts[0]] * nb_classes --> {[class_counts[0]] * nb_classes}")
+    # print()
 
     assert (
         list(class_counts.values()) == [class_counts[0]] * nb_classes
@@ -215,3 +423,68 @@ def _select_subset_of_dataset(
         return subset, raw_subset
     else:
         return subset
+    
+
+# TODO
+def default_loader(path: str):
+    with open(path, "rb") as f:
+        img = Image.open(f)
+        return img
+    
+
+
+
+"""
+
+Img2Img:
+    type(pipename): <class 'str'>
+    pipename: DDIM
+    pipes[pipename]: ConditionalDDIMPipeline {
+        "_class_name": "ConditionalDDIMPipeline",
+        "_diffusers_version": "0.18.2",
+        "scheduler": [
+            "diffusers",
+            "DDIMScheduler"
+        ],
+        "unet": [
+            "src.cond_unet_2d.cond_unet_2d",
+            "CustomCondUNet2DModel"
+        ]
+    }
+        
+
+
+
+training.py:
+<class 'src.pipeline_conditional_ddim.pipeline_conditionial_ddim.ConditionalDDIMPipeline'>
+        ConditionalDDIMPipeline {
+        "_class_name": "ConditionalDDIMPipeline",
+        "_diffusers_version": "0.18.2",
+        "scheduler": [
+            "diffusers",
+            "DDIMScheduler"
+        ],
+        "unet": [
+            "src.cond_unet_2d.cond_unet_2d",
+            "CustomCondUNet2DModel"
+        ]
+        }
+
+
+perform_class_transfer_for_training:
+<class 'src.pipeline_conditional_ddim.pipeline_conditionial_ddim.ConditionalDDIMPipeline'>
+        ConditionalDDIMPipeline {
+        "_class_name": "ConditionalDDIMPipeline",
+        "_diffusers_version": "0.18.2",
+        "scheduler": [
+            "diffusers",
+            "DDIMScheduler"
+        ],
+        "unet": [
+            "torch",
+            "DistributedDataParallel"
+        ]
+        }
+
+
+"""

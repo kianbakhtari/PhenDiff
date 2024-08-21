@@ -93,13 +93,32 @@ def main(cfg: DictConfig) -> None:
     torch.hub.set_dir(torch_hub_cache_dir)
 
     # ------------------------------------------- Debug -------------------------------------------
-    num_inference_steps, cfg = modify_debug_args(cfg, logger)
+    num_inference_steps, cfg = modify_debug_args(cfg, logger) # Kian: if not debug, num_inference_steps is None. If debug, num_inference_steps is 10.
 
     # --------------------------------- Load pretrained pipelines ---------------------------------
     logger.info(f"\033[1m==========================> Loading pipelines\033[0m")
-    pipes = call(cfg.pipeline)
+    pipes = call(cfg.pipeline) # Kian: cfg is created from config files. the "call" instanciates the pipeline which is especified by cfg.
+    # type(pipes): <class 'omegaconf.dictconfig.DictConfig'>
+    # len(pipes): 1
+
     # manage progress bars
     for pipename in pipes:
+        """
+        type(pipename): <class 'str'>
+        pipename: DDIM
+        pipes[pipename]: ConditionalDDIMPipeline {
+            "_class_name": "ConditionalDDIMPipeline",
+            "_diffusers_version": "0.18.2",
+            "scheduler": [
+                "diffusers",
+                "DDIMScheduler"
+            ],
+            "unet": [
+                "src.cond_unet_2d.cond_unet_2d",
+                "CustomCondUNet2DModel"
+            ]
+        }
+        """
         pipes[pipename].set_progress_bar_config(
             position=accelerator.process_index + 1,
             leave=False,
@@ -133,10 +152,10 @@ def main(cfg: DictConfig) -> None:
     }
 
     # Sweep over experiments
-    for class_transfer_method in cfg.class_transfer_method:
+    for class_transfer_method in cfg.class_transfer_method: # Kian: cfg.class_transfer_method is ddib
         # args
         exp_args = ClassTransferExperimentParams(
-            class_transfer_method=class_transfer_method,
+            class_transfer_method=class_transfer_method, # Kian: ddib
             num_inference_steps=num_inference_steps,
             **transfer_exp_common_params,
         )

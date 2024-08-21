@@ -105,8 +105,8 @@ class Task:
     config_name=DEFAULT_CONFIG_NAME,
 )
 def main(cfg: DictConfig) -> None:
+    # ----------- if slurm enabled ----------- #
     if cfg.slurm.enabled:
-        # SLURM
         executor = submitit.AutoExecutor(folder=cfg.slurm.output_folder)
 
         if cfg.debug:
@@ -139,6 +139,7 @@ def main(cfg: DictConfig) -> None:
             slurm_qos=qos,
             slurm_account="kio@a100",
         )
+        
 
     # CL overrides
     hydra_cfg = hydra.core.hydra_config.HydraConfig.get()  # type: ignore
@@ -161,6 +162,7 @@ def main(cfg: DictConfig) -> None:
     else:
         task()
 
+    # ----------- if slurm enabled ----------- #
     # Monitor
     if cfg.slurm.enabled and cfg.slurm.monitor:
         submitit.helpers.monitor_jobs([job])  # type: ignore

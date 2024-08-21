@@ -1,0 +1,5 @@
+golgi_5000:
+  _target_: torchvision.datasets.ImageFolder # currently not used; TODO: instantiate with Hydra
+  root: /projects/deepdevpath/Anis/diffusion-comparison-experiments/datasets/translocation_5000/
+  definition: 128
+  normalize: [0.5, 0.5] # map to [-1, 1] for SiLU
