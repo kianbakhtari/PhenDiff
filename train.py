@@ -45,7 +45,8 @@ from src.utils_training import (
     perform_class_transfer_for_paired_training,
     perform_sample_prediction_for_paired_training,
     setup_fine_tuning,
-    evaluate_paired_dataset
+    evaluate_paired_dataset,
+    EpochTimer
 )
 from src.utils_Img2Img import ClassTransferExperimentParams
 
@@ -53,6 +54,9 @@ logger: MultiProcessAdapter = get_logger(__name__, log_level="INFO")
 
 
 def main(args: Namespace):
+    #####
+    visual_inspection_interval = 250 # Also in utils training, needs to be same and set in the args
+
     # ---------------------------------- Accelerator ---------------------------------
     accelerator_project_config = ProjectConfiguration(
         total_limit=args.checkpoints_total_limit,
@@ -460,6 +464,8 @@ def main(args: Namespace):
                 is_initial_benchmark=True,
                 do_visual_inspection=True,
             )
+        
+        epoch_timer = EpochTimer()
 
     # --------------------------------- Training loop -------------------------------- 
     last_global_step_of_test_visual_inspection = 0  
@@ -531,7 +537,7 @@ def main(args: Namespace):
                 )
 
         elif args.fine_tune_with_paired_dataset_mode == "translation":
-                
+            epoch_timer.start(global_step)
             global_step, best_metric, loss_value = perform_class_transfer_for_paired_training(
                 num_update_steps_per_epoch=num_update_steps_per_epoch,
                 accelerator=accelerator,
@@ -558,6 +564,7 @@ def main(args: Namespace):
                 best_metric=best_metric if accelerator.is_main_process else None,  # type: ignore
                 chckpt_save_path=chckpt_save_path,
             )
+            epoch_timer.end(global_step, accelerator)
 
         if not args.fine_tune_with_paired_dataset_mode:
         # Generate sample images for visual inspection & metrics computation
@@ -589,7 +596,7 @@ def main(args: Namespace):
                 )
         else:
             logger.info("Evaluation on test set...")
-            do_visual_inspection = True if global_step - last_global_step_of_test_visual_inspection > 500 else False
+            do_visual_inspection = True if global_step - last_global_step_of_test_visual_inspection > visual_inspection_interval else False
             if do_visual_inspection:
                 last_global_step_of_test_visual_inspection = global_step
             test_metrics = evaluate_paired_dataset(

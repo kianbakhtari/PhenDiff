@@ -6,9 +6,9 @@
 echo -e "\n<--------------------------------------- launch_script_DDIM.sh --------------------------------------->\n"
 
 # ------------------------------------------> Variables <------------------------------------------
-exp_name=PhenDiff # experiment and output folder name; common to all runs in the same experiment
+exp_name=FineTune-Ch-Rec # experiment and output folder name; common to all runs in the same experiment
 
-run_name=PhenDiff_BSCCM2_cond_0.1_super_small_denoiser # wandb run display name
+run_name=FineTune_Ch_Rec_LARGE # wandb run display name
 
 exp_dirs_parent_folder=./experiments
 model_configs_folder=./models_configs
@@ -31,8 +31,10 @@ ${acc_cfg}
 --rdzv_backend=static
 --same_network
 --dynamo_backend=no
---gpu_ids 2
+--gpu_ids 3
+--main_process_port=29503
 "
+# --main_process_port=29501
 
 # ----------------------------------------> Script + args <----------------------------------------
 MAIN_SCRIPT=train.py
@@ -44,14 +46,25 @@ $1
 --run_name ${run_name}
 --model_type DDIM
 --components_to_train denoiser
---noise_scheduler_config_path ${model_configs_folder}/noise_scheduler/3k_steps_clipping_rescaling.json
 --denoiser_config_path ${model_configs_folder}/denoiser/super_small.json
---num_inference_steps 50
---train_data_dir /projects/deepdevpath2/Kian/datasets/BSCCM2/
+--noise_scheduler_config_path ${model_configs_folder}/noise_scheduler/3k_steps_clipping_rescaling.json
+--num_inference_steps 30
+--train_data_dir /projects/deepdevpath2/Kian/datasets/Ch-Rec/Nuc-Rest/
+--train_batch_size 128
+
+--fine_tune_with_paired_dataset_mode translation
+--fine_tune_experiment_by_paired_training /projects/deepdevpath2/Kian/PhenDiff/experiments/Ch-Rec/PhenDiff_Ch_Rec_main/checkpoints/step_40000
+--paired_train_data_dir /projects/deepdevpath2/Kian/datasets/Ch-Rec/Nuc-Rest-paired-large/
+--test_data_dir /projects/deepdevpath2/Kian/datasets/Ch-Rec/Nuc-Rest/test/
+--source_class_for_paired_training rest
+--paired_training_loss mse
+--paired_train_batch_size 2
+
+--denoiser_in_channels 3
+--denoiser_out_channels 3
 --definition 128
---train_batch_size 80
 --eval_batch_size 256
---max_num_steps 50000
+--max_num_steps 42000
 --learning_rate 3e-4
 --mixed_precision fp16
 --eval_save_model_every_epochs 50
@@ -65,6 +78,16 @@ $1
 --compute_kid
 --wandb_entity kian-team
 "
+
+
+# --fine_tune_with_paired_dataset_mode translation
+# --fine_tune_experiment_by_paired_training /projects/deepdevpath2/Kian/PhenDiff/experiments/PhenDiff/PhenDiff_TN_cond_super_small_denoiser_config/checkpoints/step_25000
+# --paired_train_data_dir /projects/deepdevpath2/Kian/datasets/KDSB/KDSB-paired-purpule/
+# --test_data_dir /projects/deepdevpath2/Kian/datasets/TissueNet/TN-binary-test/nuc/train/
+# --source_class_for_paired_training images
+# --paired_training_loss bce
+# --paired_train_batch_size 2
+
 
 # ----------------------------------------> Echo commands <----------------------------------------
 echo -e "START TIME: $(date)\n"

@@ -19,6 +19,7 @@ from argparse import Namespace
 from inspect import signature
 from math import ceil
 from pathlib import Path
+import time
 from shutil import rmtree
 
 import numpy as np
@@ -592,7 +593,7 @@ def perform_class_transfer_for_paired_training(
             )
             logger.error(msg)
 
-        if global_step % 500 == 0:
+        if global_step % 250 == 0:
             do_visual_inspection_and_log = True
 
     progress_bar.close()
@@ -1712,12 +1713,7 @@ def evaluate_paired_dataset(
             bce, dice = None, None # Default
 
             if args.paired_training_loss.lower().strip() == "bce":
-                # assert all(value in [-1, 1] for value in target_images.unique()), "target_images should be binary in {-1, 1}"
-                if not all(value in [-1, 1] for value in target_images.unique()):
-                    print("\nHere")
-                    print(target_images.unique())
-                    exit()
-
+                assert all(value in [-1, 1] for value in target_images.unique()), "target_images should be binary in {-1, 1}"
                 target_images = make_tensor_binary(target_images) # Going from {-1, 1} to {0, 1}
                 num_positive = (target_images == 1).sum().item()
                 num_negative = (target_images == 0).sum().item()
@@ -1768,3 +1764,38 @@ def evaluate_paired_dataset(
             split=split
         )
     return logs
+
+
+class EpochTimer:
+    def __init__(self):
+        self.start_time = None
+        self.start_gs = None
+        self.end_time = None
+        self.end_gs = None
+
+    def start(self, global_step):
+        self.start_time = time.time()
+        self.start_gs = global_step
+        self.end_time = None
+        self.end_gs = None
+
+    def end(self, global_step, accelerator):
+        self.end_time = time.time()
+        self.end_gs = global_step
+        epoch_elapsed_time_mins = round((self.end_time - self.start_time) / 60, 2)
+        epoch_elapsed_steps = self.end_gs - self.start_gs
+        step_elapsed_time_secs = round((self.end_time - self.start_time) / epoch_elapsed_steps, 2)
+        accelerator.log(
+            {
+                "epoch_elapsed_time_mins": epoch_elapsed_time_mins,
+                "step_elapsed_time_secs": step_elapsed_time_secs,
+            },
+            step=self.end_gs,
+        )
+        
+
+
+
+    
+
+    

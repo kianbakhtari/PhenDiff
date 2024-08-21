@@ -7,10 +7,10 @@ echo -e "\n<--------------------------------------- launch_script_DDIM.sh ------
 
 # ------------------------------------------> Variables <------------------------------------------
 # experiment and output folder name; common to all runs in the same experiment
-exp_name=FineTune 
+exp_name=FineTune_KDSB
 
 # wandb run display name
-run_name=KDSB_on_paired_LARGE_from_KDSB_checkpoints_step_50000_with_BCE
+run_name=FineTune_KDSB_SMALL
 
 exp_dirs_parent_folder=./experiments
 model_configs_folder=./models_configs
@@ -33,7 +33,7 @@ ${acc_cfg}
 --rdzv_backend=static
 --same_network
 --dynamo_backend=no
---gpu_ids 1
+--gpu_ids 2
 --main_process_port=29502
 "
 # --main_process_port=29501
@@ -52,12 +52,11 @@ $1
 --noise_scheduler_config_path ${model_configs_folder}/noise_scheduler/3k_steps_clipping_rescaling.json
 --num_inference_steps 30
 --train_data_dir /projects/deepdevpath2/Kian/datasets/KDSB/
---fine_tune_with_paired_dataset None
 --train_batch_size 128
 
 --fine_tune_with_paired_dataset_mode translation
---fine_tune_experiment_by_paired_training /projects/deepdevpath2/Kian/PhenDiff/experiments/PhenDiff/KDSB/checkpoints/step_50000
---paired_train_data_dir /projects/deepdevpath2/Kian/datasets/KDSB/KDSB-paired-large/
+--fine_tune_experiment_by_paired_training /projects/deepdevpath2/Kian/PhenDiff/experiments/PhenDiff_KDSB/PhenDiff_KDSB_main/checkpoints/step_40000
+--paired_train_data_dir /projects/deepdevpath2/Kian/datasets/KDSB/KDSB-paired-small/
 --test_data_dir /projects/deepdevpath2/Kian/datasets/KDSB/KDSB-test/
 --source_class_for_paired_training images
 --paired_training_loss bce
@@ -67,7 +66,7 @@ $1
 --denoiser_out_channels 3
 --definition 128
 --eval_batch_size 256
---max_num_steps 55000
+--max_num_steps 41500
 --learning_rate 3e-4
 --mixed_precision fp16
 --eval_save_model_every_epochs 50
@@ -84,10 +83,10 @@ $1
 
 # --fine_tune_with_paired_dataset_mode translation
 # --fine_tune_experiment_by_paired_training /projects/deepdevpath2/Kian/PhenDiff/experiments/PhenDiff/KDSB/checkpoints/step_50000
-# --paired_train_data_dir /projects/deepdevpath2/Kian/datasets/KDSB/KDSB-paired-small/
+# --paired_train_data_dir /projects/deepdevpath2/Kian/datasets/TissueNet/TN-binary-paired-tiny/nuc/
 # --test_data_dir /projects/deepdevpath2/Kian/datasets/KDSB/KDSB-test/
 # --source_class_for_paired_training images
-# --paired_training_loss mse
+# --paired_training_loss bce
 # --paired_train_batch_size 2
 
 # ----------------------------------------> Echo commands <----------------------------------------

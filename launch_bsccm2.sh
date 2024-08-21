@@ -6,11 +6,9 @@
 echo -e "\n<--------------------------------------- launch_script_DDIM.sh --------------------------------------->\n"
 
 # ------------------------------------------> Variables <------------------------------------------
-# experiment and output folder name; common to all runs in the same experiment
-exp_name=8x-Super-Res-FineTune
+exp_name=Fine-Tune-BSCCM2 # experiment and output folder name; common to all runs in the same experiment
 
-# wandb run display name
-run_name=8x_MEDIUM
+run_name=run_LARGE # wandb run display name
 
 exp_dirs_parent_folder=./experiments
 model_configs_folder=./models_configs
@@ -33,10 +31,9 @@ ${acc_cfg}
 --rdzv_backend=static
 --same_network
 --dynamo_backend=no
---gpu_ids 3
---main_process_port=29503
+--gpu_ids 2
+--main_process_port=29502
 "
-# --main_process_port=29501
 
 # ----------------------------------------> Script + args <----------------------------------------
 MAIN_SCRIPT=train.py
@@ -48,17 +45,17 @@ $1
 --run_name ${run_name}
 --model_type DDIM
 --components_to_train denoiser
---denoiser_config_path ${model_configs_folder}/denoiser/super_small.json
 --noise_scheduler_config_path ${model_configs_folder}/noise_scheduler/3k_steps_clipping_rescaling.json
+--denoiser_config_path ${model_configs_folder}/denoiser/super_small.json
 --num_inference_steps 30
---train_data_dir /projects/deepdevpath2/Kian/datasets/Super-Res/8x/low_res_dataset_8x/
---train_batch_size 128
+--train_data_dir /projects/deepdevpath2/Kian/datasets/BSCCM2/
+--train_batch_size 112
 
 --fine_tune_with_paired_dataset_mode translation
---fine_tune_experiment_by_paired_training /projects/deepdevpath2/Kian/PhenDiff/experiments/PhenDiff/SuperRes8x_bbc021_cond_0.2_ssd/checkpoints/step_50000
---paired_train_data_dir /projects/deepdevpath2/Kian/datasets/Super-Res/8x/paired-medium/
---test_data_dir /projects/deepdevpath2/Kian/datasets/Super-Res/8x/test/
---source_class_for_paired_training low_res
+--fine_tune_experiment_by_paired_training /projects/deepdevpath2/Kian/PhenDiff/experiments/PhenDiff/PhenDiff_BSCCM2_cond_0.1_super_small_denoiser/checkpoints/step_48000
+--paired_train_data_dir /projects/deepdevpath2/Kian/datasets/BSCCM2/paired-large/
+--test_data_dir /projects/deepdevpath2/Kian/datasets/BSCCM2/test/
+--source_class_for_paired_training high_na
 --paired_training_loss mse
 --paired_train_batch_size 2
 
@@ -66,7 +63,7 @@ $1
 --denoiser_out_channels 3
 --definition 128
 --eval_batch_size 256
---max_num_steps 55000
+--max_num_steps 49500
 --learning_rate 3e-4
 --mixed_precision fp16
 --eval_save_model_every_epochs 50
@@ -81,14 +78,6 @@ $1
 --wandb_entity kian-team
 "
 
-# --fine_tune_with_paired_dataset_mode translation
-# --fine_tune_experiment_by_paired_training /projects/deepdevpath2/Kian/PhenDiff/experiments/PhenDiff/KDSB/checkpoints/step_50000
-# --paired_train_data_dir /projects/deepdevpath2/Kian/datasets/KDSB/KDSB-paired-small/
-# --test_data_dir /projects/deepdevpath2/Kian/datasets/KDSB/KDSB-test/
-# --source_class_for_paired_training images
-# --paired_training_loss mse
-# --paired_train_batch_size 2
-
 # ----------------------------------------> Echo commands <----------------------------------------
 echo -e "START TIME: $(date)\n"
 echo -e "EXPERIMENT NAME: ${exp_name}\n"
@@ -101,4 +90,4 @@ echo -e "MAIN_SCRIPT_ARGS: ${MAIN_SCRIPT_ARGS}\n"
 # Launch the job
 accelerate launch ${ACCELERATE_CONFIG} ${MAIN_SCRIPT} ${MAIN_SCRIPT_ARGS}
 
-exit 0v
+exit 0

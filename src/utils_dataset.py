@@ -106,7 +106,7 @@ class PairedSamplesDataset(Dataset):
     def __init__(self, args, root : str, source_class : Optional[str] = None, transform: JointTransforms = None):
         root = os.path.abspath(root)
         class_directories = glob.glob(os.path.join(root, '*'))
-        assert len(class_directories) == 2, f"There sould be two and only two classes under the root: {root}"
+        assert len(class_directories) == 2, f"There sould be two and only two classes under the root: {root} , found: {class_directories}"
 
         if not all([os.path.isdir(d) for d in class_directories]):
             raise Exception(f"There should be only directories under the root: {root}")
