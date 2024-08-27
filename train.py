@@ -54,9 +54,6 @@ logger: MultiProcessAdapter = get_logger(__name__, log_level="INFO")
 
 
 def main(args: Namespace):
-    #####
-    visual_inspection_interval = 250 # Also in utils training, needs to be same and set in the args
-
     # ---------------------------------- Accelerator ---------------------------------
     accelerator_project_config = ProjectConfiguration(
         total_limit=args.checkpoints_total_limit,
@@ -596,7 +593,7 @@ def main(args: Namespace):
                 )
         else:
             logger.info("Evaluation on test set...")
-            do_visual_inspection = True if global_step - last_global_step_of_test_visual_inspection > visual_inspection_interval else False
+            do_visual_inspection = True if global_step - last_global_step_of_test_visual_inspection > args.visual_inspection_interval else False
             if do_visual_inspection:
                 last_global_step_of_test_visual_inspection = global_step
             test_metrics = evaluate_paired_dataset(

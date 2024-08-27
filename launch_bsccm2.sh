@@ -58,6 +58,7 @@ $1
 --source_class_for_paired_training high_na
 --paired_training_loss mse
 --paired_train_batch_size 2
+--visual_inspection_interval 250
 
 --denoiser_in_channels 3
 --denoiser_out_channels 3

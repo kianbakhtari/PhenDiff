@@ -593,7 +593,7 @@ def perform_class_transfer_for_paired_training(
             )
             logger.error(msg)
 
-        if global_step % 250 == 0:
+        if global_step % args.visual_inspection_interval == 0:
             do_visual_inspection_and_log = True
 
     progress_bar.close()
