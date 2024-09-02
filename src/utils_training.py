@@ -1568,45 +1568,35 @@ def save_pipeline(
 
 
 def setup_fine_tuning(args, chckpt_save_path, logger):
-    # if not args.fine_tune_experiment_by_paired_training.endswith("/"):
-    #     raise Exception(f"args.fine_tune_experiment_by_paired_training should end in /.")
+    """
+    This function copies the pre-trained model's checkpoint to the current chckpt_save_path,
+    so that the fine-tuning can be started from the pre-trained model's checkpoint.
+    """
     if not chckpt_save_path.endswith("/"):
         chckpt_save_path += "/"
 
-    if args.fine_tune_experiment_by_paired_training.endswith("/"):
-        checkpoint_dir_name = os.path.basename(args.fine_tune_experiment_by_paired_training[:-1])
-    else:
-        checkpoint_dir_name = os.path.basename(args.fine_tune_experiment_by_paired_training)
-    
-    # print("\n#####")
-    # print(args.fine_tune_experiment_by_paired_training)
-    # print(chckpt_save_path)
-    # print("#####\n")
+    checkpoint_dir_name = os.path.basename(args.fine_tune_experiment_by_paired_training.rstrip('/'))
 
     if not os.path.isdir(chckpt_save_path):
-        raise Exception("os.path.isdir(chckpt_save_path) is false")
-    if not os.path.isdir(args.fine_tune_experiment_by_paired_training):
-        raise Exception("os.path.isdir(args.fine_tune_experiment_by_paired_training) is false")
-
-    cmd = f"cp -r {args.fine_tune_experiment_by_paired_training} {chckpt_save_path}"
+        raise NotADirectoryError(f"chckpt_save_path {chckpt_save_path} is not a directory")
     
-    print("CMD:\n", cmd)
+    if not os.path.isdir(args.fine_tune_experiment_by_paired_training):
+        raise NotADirectoryError(f"args.fine_tune_experiment_by_paired_training
+                                 {args.fine_tune_experiment_by_paired_training} is not a directory")
 
+    # Creating and running the command
+    cmd = f"cp -r {args.fine_tune_experiment_by_paired_training} {chckpt_save_path}"
     exc_code = os.system(cmd)
     if exc_code != 0:
         raise Exception(f"exit code {exc_code} for command: {cmd}")
-
     logger.info(
         f"Pre-trained checkpoint coppied:\nFrom: {args.fine_tune_experiment_by_paired_training}\nTo: {chckpt_save_path}\n"
     )
-    print(f"Pre-trained checkpoint coppied:\nFrom: {args.fine_tune_experiment_by_paired_training}\nTo: {chckpt_save_path}\n")
 
     args.resume_from_checkpoint = checkpoint_dir_name
-
     logger.info(
         f"args.resume_from_checkpoint is updated: {args.resume_from_checkpoint}"
     )
-    print(f"args.resume_from_checkpoint is updated: {args.resume_from_checkpoint}")
 
 
 def dice_score(pred: torch.Tensor, target: torch.Tensor) -> float:

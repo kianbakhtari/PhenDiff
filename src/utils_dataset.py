@@ -183,19 +183,12 @@ def setup_dataset(
 ) -> tuple[ImageFolder | Subset, NoLabelsDataset | Subset, int]:
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
-
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
 
     #################################################
-    # def default_loader(path: str) -> Image.Image:
-    #     with open(path, "rb") as f:
-    #         img = Image.open(BytesIO(f.read()))
-    #         # img_array = np.array(img)
-    #         # print("\n\n\nPIl LOADER")
-    #         # print(img_array.shape)
-    #         return img
-
+    # The following three functions are copied from https://pytorch.org/vision/main/_modules/torchvision/datasets/folder.html#ImageFolder
+    # and modified to avoid the default conversion of images to RGB. This is necessary for those cases where the images are single-channel.
     def pil_loader(path: str) -> Image.Image:
         # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
         with open(path, "rb") as f:
@@ -204,7 +197,6 @@ def setup_dataset(
 
     def accimage_loader(path: str) -> Any:
         import accimage
-
         try:
             return accimage.Image(path)
         except OSError:
@@ -213,7 +205,6 @@ def setup_dataset(
 
     def default_loader(path: str) -> Any:
         from torchvision import get_image_backend
-
         if get_image_backend() == "accimage":
             return accimage_loader(path)
         else:
@@ -318,10 +309,10 @@ def setup_dataset(
 
 
 def setup_paired_dataset(
-    args: Namespace, logger: MultiProcessAdapter, test_split:bool=False
+    args: Namespace, test_split:bool=False
 ) -> PairedSamplesDataset:
     
-    assert args.use_pytorch_loader, "You should use args.use_pytorch_loader for using paired samples"
+    assert args.use_pytorch_loader, "The args.use_pytorch_loader should be true for fine-tuning with paired samples"
 
     if test_split:
         test_dataset: PairedSamplesDataset = PairedSamplesDataset(

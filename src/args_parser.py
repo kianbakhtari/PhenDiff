@@ -105,7 +105,6 @@ def parse_args() -> Namespace:
         type=float,
         help="The percentage of samples (∈ ]0; 100]) to use from the training dataset *inside each class*.",
     )
-
     parser.add_argument(
         "--data_aug_on_the_fly",
         action="store_true",
@@ -457,23 +456,25 @@ def parse_args() -> Namespace:
             ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
         ),
     )
+
+    # New args added for fine-tuning functionalities
     parser.add_argument(
         "--denoiser_in_channels",
         type=int,
         default=3,
-        help="Number of input channels",
+        help="Number of input channels. Default is 3 for RGB images. denoiser_in_channels and denoiser_out_channels should be equal.",
     )
     parser.add_argument(
         "--denoiser_out_channels",
         type=int,
-        default="",
-        help="Number of output channels",
+        default=3,
+        help="Number of output channels. Default is 3 for RGB images. denoiser_in_channels and denoiser_out_channels should be equal.",
     )
     parser.add_argument(
         "--fine_tune_with_paired_dataset_mode",
         type=str,
         help=(
-            "Paired training method: sample or translation"
+            "Fine-tuning method: should be either sample or translation. Please note that the sample mood has not been tested yet and may produce bugs."
         ),
     )
     parser.add_argument(
@@ -481,9 +482,8 @@ def parse_args() -> Namespace:
         type=str,
         default=None,
         help=(
-            "A folder containing the paired training data. Folder contents must follow the structure described in"
-            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
-            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
+            "Path to the paired training data. There should be a train directory under this path, containing subdirectories for each class."
+            " Note that images' names should be the same under classes (to provide one to one correspondence)."
         ),
     )
     parser.add_argument(
@@ -491,16 +491,15 @@ def parse_args() -> Namespace:
         type=str,
         default=None,
         help=(
-            "Test data dir"
+            "Path to the test (paired) data directory."
         ),
     )
-    
     parser.add_argument(
         "--source_class_for_paired_training",
         type=str,
         default=None,
         help=(
-            "A folder containing the images of the source class, when the translation task is one-way, like segmentation."
+            "The source-class directory, when the translation task is one-way, like segmentation."
         ),
     )
     parser.add_argument(
@@ -510,35 +509,29 @@ def parse_args() -> Namespace:
             "Loss for paired training. mse or bce."
         ),
     )
-    # parser.add_argument(
-    #     "--perform_translation_for_paired_training_every_epochs",
-    #     type=int,
-    #     default=0,
-    #     help=(
-    #         "Perform image translation (class transfer) on paired dataset for training every x epochs. Put 0 for disabling translation for paired training."
-    #     ),
-    # )
-    # parser.add_argument(
-    #     "--perform_sample_prediction_for_paired_training_every_epochs",
-    #     type=int,
-    #     default=0,
-    #     help=(
-    #         "Perform sample prediction from noisy-other-class on paired dataset for training every x epochs. Put 0 for disabling sample prediction for paired training."
-    #     ),
-    # )
-    parser.add_argument("--no_data_aug_on_the_fly", action="store_false", dest="data_aug_on_the_fly", help="Disable data augmentation")
+    parser.add_argument(
+        "--no_data_aug_on_the_fly",
+        action="store_false",
+        dest="data_aug_on_the_fly",
+        help="Disable data augmentation"
+    )
     parser.add_argument(
         "--paired_train_batch_size",
         type=int,
         required=False,
         help="Batch size (per device) for the pairedtraining dataloader.",
     )
-    parser.add_argument("--no_compute_fid", action="store_false", dest="compute_fid", help="Disable FID computation")
+    parser.add_argument(
+        "--no_compute_fid",
+        action="store_false",
+        dest="compute_fid",
+        help="Disable FID computation"
+    )
     parser.add_argument(
         "--fine_tune_experiment_by_paired_training",
         type=str,
         help=(
-            "Path to the last checkpoint of unpaired experiment"
+            "Path to the last checkpoint directory (step_SomeNumber) of the unpaired experiment that you want to fine-tune with the paired dataset.",
         ),
     )
     parser.add_argument(
@@ -548,7 +541,6 @@ def parse_args() -> Namespace:
         default=250,
         help="Interval of performing visual inspection of the generated images during fine-tuning with paired dataset",
     )
-    
 
 
     # parse args

@@ -81,7 +81,7 @@ def main(args: Namespace):
     )
 
     # ----------------------------- Setup pre-trained model -----------------------------
-    # Setup pre-trained model if fine-tuning with paired dataset
+    # Load the pre-trained model if we are fine-tuning with paired dataset:
     if accelerator.is_main_process and args.fine_tune_experiment_by_paired_training:
         chckpt_save_path = get_chckpt_save_path(args, accelerator, logger)
         setup_fine_tuning(args, chckpt_save_path, logger)
@@ -220,7 +220,7 @@ def main(args: Namespace):
     # here they are only used as convenient "supermodel" wrappers
     pipeline = load_initial_pipeline(
         args, initial_pipeline_save_folder, logger, nb_classes, accelerator
-    ) # Kian: ConditionalDDIMPipeline
+    )
 
     # --------------------------- Move & Freeze Components ---------------------------
     # Move components to device
@@ -416,9 +416,9 @@ def main(args: Namespace):
         raise ValueError(f"args.fine_tune_with_paired_dataset_mode should be either sample or translation,\
                 not {args.fine_tune_with_paired_dataset_mode}")
     
-    # Some things to do before paired dataset fine-tuning
-    if args.fine_tune_with_paired_dataset_mode in ["sample", "translation"]:
-        # Reseting the learning rate to the oroiginal value
+    # Some things to do before fine-tuning with paired dataset
+    if args.fine_tune_with_paired_dataset_mode:
+        # Reseting the learning rate to the oroiginal (initial) value
         for param_group in optimizer.param_groups:
             param_group['lr'] = args.learning_rate
         
@@ -430,14 +430,15 @@ def main(args: Namespace):
         )
         lr_scheduler = accelerator.prepare(lr_scheduler)
 
-        # Initial evaluation on train dataset
-        initial_train_metrics = evaluate_paired_dataset(
+        # Initial evaluation on train and test datasets to find the baseline right before the fine-tuning
+        for split, dataloader in [("train", paired_dataloader), ("test", test_dataloader)]:
+            evaluate_paired_dataset(
                 num_update_steps_per_epoch=num_update_steps_per_epoch,
                 accelerator=accelerator,
                 pipeline=pipeline,
                 epoch=epoch,
-                dataloader=paired_dataloader,
-                split="train",
+                dataloader=dataloader,
+                split=split,
                 args=args,
                 global_step=global_step,
                 lr_scheduler=lr_scheduler,
@@ -446,22 +447,7 @@ def main(args: Namespace):
                 do_visual_inspection=True,
             )
 
-        # Initial evaluation on test dataset
-        initial_test_metrics = evaluate_paired_dataset(
-                num_update_steps_per_epoch=num_update_steps_per_epoch,
-                accelerator=accelerator,
-                pipeline=pipeline,
-                epoch=epoch,
-                dataloader=test_dataloader,
-                split="test",
-                args=args,
-                global_step=global_step,
-                lr_scheduler=lr_scheduler,
-                logger=logger,
-                is_initial_benchmark=True,
-                do_visual_inspection=True,
-            )
-        
+        # Instantiate an epoch timer
         epoch_timer = EpochTimer()
 
     # --------------------------------- Training loop -------------------------------- 
@@ -470,8 +456,9 @@ def main(args: Namespace):
         epoch < (args.max_num_epochs if args.max_num_epochs is not None else inf)
         and global_step < tot_training_steps
     ):
+        epoch_timer.start(global_step)
         if not args.fine_tune_with_paired_dataset_mode:
-
+            # unpaired training
             global_step, best_metric = perform_training_epoch(
                 num_update_steps_per_epoch=num_update_steps_per_epoch,
                 accelerator=accelerator,
@@ -501,9 +488,7 @@ def main(args: Namespace):
                 chckpt_save_path=chckpt_save_path,
                 paired_dataloader=paired_dataloader
             )
-
         elif args.fine_tune_with_paired_dataset_mode == "sample":
-
             global_step, best_metric, loss_value = perform_sample_prediction_for_paired_training(
                     num_update_steps_per_epoch=num_update_steps_per_epoch,
                     accelerator=accelerator,
@@ -532,9 +517,7 @@ def main(args: Namespace):
                     best_metric=best_metric if accelerator.is_main_process else None,  # type: ignore
                     chckpt_save_path=chckpt_save_path,
                 )
-
         elif args.fine_tune_with_paired_dataset_mode == "translation":
-            epoch_timer.start(global_step)
             global_step, best_metric, loss_value = perform_class_transfer_for_paired_training(
                 num_update_steps_per_epoch=num_update_steps_per_epoch,
                 accelerator=accelerator,
@@ -561,10 +544,10 @@ def main(args: Namespace):
                 best_metric=best_metric if accelerator.is_main_process else None,  # type: ignore
                 chckpt_save_path=chckpt_save_path,
             )
-            epoch_timer.end(global_step, accelerator)
+        epoch_timer.end(global_step, accelerator)
 
         if not args.fine_tune_with_paired_dataset_mode:
-        # Generate sample images for visual inspection & metrics computation
+        # Generate sample images for visual inspection & metrics computation (unpaired training)
             if args.eval_save_model_every_epochs is not None and (
                 epoch % args.eval_save_model_every_epochs == 0
                 or (
@@ -596,7 +579,7 @@ def main(args: Namespace):
             do_visual_inspection = True if global_step - last_global_step_of_test_visual_inspection > args.visual_inspection_interval else False
             if do_visual_inspection:
                 last_global_step_of_test_visual_inspection = global_step
-            test_metrics = evaluate_paired_dataset(
+            evaluate_paired_dataset(
                 num_update_steps_per_epoch=num_update_steps_per_epoch,
                 accelerator=accelerator,
                 pipeline=pipeline,
