@@ -1581,7 +1581,7 @@ def setup_fine_tuning(args, chckpt_save_path, logger):
         raise NotADirectoryError(f"chckpt_save_path {chckpt_save_path} is not a directory")
     
     if not os.path.isdir(args.fine_tune_experiment_by_paired_training):
-        raise NotADirectoryError(f"args.fine_tune_experiment_by_paired_training
+        raise NotADirectoryError(f"args.fine_tune_experiment_by_paired_training\
                                  {args.fine_tune_experiment_by_paired_training} is not a directory")
 
     # Creating and running the command

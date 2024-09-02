@@ -184,7 +184,7 @@ def main(args: Namespace):
 
     paired_dataloader = None
     if args.paired_train_data_dir is not None:
-        paired_dataset = setup_paired_dataset(args, logger)
+        paired_dataset = setup_paired_dataset(args)
         paired_dataloader = torch.utils.data.DataLoader(  # type: ignore
             paired_dataset,
             batch_size=args.paired_train_batch_size,
@@ -197,7 +197,7 @@ def main(args: Namespace):
         
     test_dataloader = None
     if args.test_data_dir is not None:
-        test_dataset = setup_paired_dataset(args, logger, test_split=True)
+        test_dataset = setup_paired_dataset(args, test_split=True)
         test_dataloader = torch.utils.data.DataLoader(  # type: ignore
             test_dataset,
             batch_size=args.paired_train_batch_size * 2,

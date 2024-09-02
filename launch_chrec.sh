@@ -6,9 +6,9 @@
 echo -e "\n<--------------------------------------- launch_script_DDIM.sh --------------------------------------->\n"
 
 # ------------------------------------------> Variables <------------------------------------------
-exp_name=FineTune-Ch-Rec # experiment and output folder name; common to all runs in the same experiment
+exp_name=Dev-ReFac # experiment and output folder name; common to all runs in the same experiment
 
-run_name=FineTune_Ch_Rec_LARGE # wandb run display name
+run_name=FineTune_Ch_Rec_TINY # wandb run display name
 
 exp_dirs_parent_folder=./experiments
 model_configs_folder=./models_configs
@@ -31,10 +31,9 @@ ${acc_cfg}
 --rdzv_backend=static
 --same_network
 --dynamo_backend=no
---gpu_ids 3
---main_process_port=29503
+--gpu_ids 0
+--main_process_port=29500
 "
-# --main_process_port=29501
 
 # ----------------------------------------> Script + args <----------------------------------------
 MAIN_SCRIPT=train.py
@@ -54,7 +53,7 @@ $1
 
 --fine_tune_with_paired_dataset_mode translation
 --fine_tune_experiment_by_paired_training /projects/deepdevpath2/Kian/PhenDiff/experiments/Ch-Rec/PhenDiff_Ch_Rec_main/checkpoints/step_40000
---paired_train_data_dir /projects/deepdevpath2/Kian/datasets/Ch-Rec/Nuc-Rest-paired-large/
+--paired_train_data_dir /projects/deepdevpath2/Kian/datasets/Ch-Rec/Nuc-Rest-paired-tiny/
 --test_data_dir /projects/deepdevpath2/Kian/datasets/Ch-Rec/Nuc-Rest/test/
 --source_class_for_paired_training rest
 --paired_training_loss mse
