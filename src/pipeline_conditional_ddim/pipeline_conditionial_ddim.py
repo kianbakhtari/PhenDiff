@@ -138,7 +138,7 @@ class ConditionalDDIMPipeline(DiffusionPipeline):
             ) and 0 <= frac_diffusion_skipped <= 1, "frac_diffusion_skipped must be a float (or int) between 0 and 1; got {frac_diffusion_skipped}."
     
     @torch.no_grad()
-    def _original_no_grad_call(
+    def _img2img_translation_call(
             self,
             class_labels: torch.Tensor | None,
             class_emb: torch.Tensor | None = None,
@@ -154,6 +154,12 @@ class ConditionalDDIMPipeline(DiffusionPipeline):
             frac_diffusion_skipped: Optional[float] = None,
             guidance_eqn: Literal["imagen", "CFG"] = "imagen",
     ) -> Union[ImagePipelineOutput, Tuple]:
+        """
+         Returns:
+            [`~pipelines.ImagePipelineOutput`] or `tuple`: [`~pipelines.utils.ImagePipelineOutput`] if `return_dict` is
+            True, otherwise a `tuple. When returning a tuple, the first element is a list with the generated images.
+        """
+
         # Checks
         self.check_inputs(
             class_labels,
@@ -320,7 +326,7 @@ class ConditionalDDIMPipeline(DiffusionPipeline):
         return ImagePipelineOutput(images=image)
 
 
-    def _new_call_for_paired_training(
+    def _paired_training_call(
         self,
         class_labels: torch.Tensor | None,
         class_emb: torch.Tensor | None = None,
@@ -513,6 +519,8 @@ class ConditionalDDIMPipeline(DiffusionPipeline):
     ) -> Union[ImagePipelineOutput, Tuple]:
         r"""
         Args:
+            for_testing (`bool`):
+                Whether to run the pipeline in testing mode or not. The testing mode simply calls the pipeline with torch.no_grad().
             class_labels (`torch.Tensor` or None):
                 The class labels to condition on. Should be a tensor of shape `(batch_size,)` or `None` if `class_emb` is directly given.
             class_emb (`torch.Tensor` or None):
@@ -548,16 +556,16 @@ class ConditionalDDIMPipeline(DiffusionPipeline):
                 What guidance equation to use. Can be either that of the [Imagen](https://arxiv.org/pdf/2205.11487.pdf#subsection.2.2) paper
                 or that of the original [Classifier-Free Diffusion Guidance](https://arxiv.org/pdf/2207.12598.pdf#equation.3.6) paper.
                 CFG might not be used if `w` is small enough, depending on the equation used.
-
-        Returns:
-            [`~pipelines.ImagePipelineOutput`] or `tuple`: [`~pipelines.utils.ImagePipelineOutput`] if `return_dict` is
-            True, otherwise a `tuple. When returning a tuple, the first element is a list with the generated images.
         """
-
+        # If the self.unet object is an instance of the DistributedDataParallel class, then we are in the middle of training (fine-tuning).
+        # Thus, we call the new call function of the ConditionalDDIMPipeline which is meant to be used at training time, for fine-tuning 
+        # with paired samples.
         if isinstance(self.unet, DistributedDataParallel):
             if for_testing:
+
+                # We run the translation in the middle of training (fine-tuning) for testing purposes (with torch.no_grad()).
                 with torch.no_grad():
-                    return self._new_call_for_paired_training(
+                    return self._paired_training_call(
                         class_labels=class_labels,
                         class_emb=class_emb,
                         w=w,
@@ -572,8 +580,9 @@ class ConditionalDDIMPipeline(DiffusionPipeline):
                         frac_diffusion_skipped=frac_diffusion_skipped,
                         guidance_eqn=guidance_eqn
                     ).clamp(-1, 1)
-                
-            return self._new_call_for_paired_training(
+            
+            # The new call function of the ConditionalDDIMPipeline which is meant to be used at training (fine-tuning) without torch.no_grad().
+            return self._paired_training_call(
                 class_labels=class_labels,
                 class_emb=class_emb,
                 w=w,
@@ -589,7 +598,9 @@ class ConditionalDDIMPipeline(DiffusionPipeline):
                 guidance_eqn=guidance_eqn
             )
 
-        return self._original_no_grad_call(
+        # Calling the original PhenDiff's ConditionalDDIMPipeline which is meant to be used at inference time,
+        # for image to image translation.
+        return self._img2img_translation_call(
             class_labels=class_labels,
             class_emb=class_emb,
             w=w,

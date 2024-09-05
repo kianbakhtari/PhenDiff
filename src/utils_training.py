@@ -381,8 +381,19 @@ def paired_dataset_visual_inspection_and_log(
         translated_images: torch.tensor,
         split: str
 ):
+    """
+    Logs a table of paired image data (source, target, translated) to Weights & Biases (wandb) for visual inspection.
+
+    Returns:
+        None: The function does not return any value.
+
+    Note:
+        - The function processes only the first 10 images in each batch for logging.
+    """
     def process(tensor: torch.tensor) -> np.ndarray:
             return tensor.detach()[:10].permute(0, 2, 3, 1).cpu().numpy()
+    
+    assert split in ["train", "test"], "split should be one of ['train', 'test']"
 
     if accelerator.is_main_process:
         source_images_processed_for_logging = process(source_images)
@@ -442,23 +453,16 @@ def perform_class_transfer_for_paired_training(
     epoch: int,
     dataloader: DataLoader,
     args: Namespace,
-    first_epoch: int,
-    resume_step: int,
     global_step: int,
     optimizer,
     lr_scheduler,
     logger: MultiProcessAdapter,
-    params_to_clip: list,
-    tot_training_steps: int,
-    image_generation_tmp_save_folder: Path,
-    fidelity_cache_root: Path,
-    actual_eval_batch_sizes_for_this_process: list[int],
-    nb_classes: int,
-    full_pipeline_save_folder: Path,
-    repo,
     best_metric,
     chckpt_save_path: Path,
 ) -> tuple[int, float | None]:
+    """
+    This function transfers source images to target class, and then computes and optimizes loss by comparing them to the target images.
+    """
     
     def make_tensor_binary(tensor: torch.Tensor) -> torch.Tensor:
         # The input tensor should be centered around 0
@@ -467,15 +471,14 @@ def perform_class_transfer_for_paired_training(
         assert torch.all((tensor == 0) | (tensor == 1)), "tensor should be binary."
         return tensor
         
-    pipe = pipeline
+    pipe = pipeline # pipe and pipline are the same thing and used interchangeably.
     denoiser_model = pipeline.unet
     denoiser_model.train()
-    num_inference_steps = 30
+    num_inference_steps = args.num_inference_steps
+
     # ----------- Distributed inference & device placement ----------- #
     dataloader = accelerator.prepare(dataloader)
-    # pipe = pipe.to(accelerator.device)
 
-    # ----------- Creat save directories ----------- #
     accelerator.wait_for_everyone()
 
     progress_bar = tqdm(
@@ -487,6 +490,7 @@ def perform_class_transfer_for_paired_training(
     # ----------- Iterate Over Batches ----------- #
     do_visual_inspection_and_log = False
 
+    # 'accu' stands for 'accumulated'. We will accumulate the first 20 images for visual inspection.
     sources_accu = []
     targets_accu = []
     translateds_accu = []
@@ -509,8 +513,8 @@ def perform_class_transfer_for_paired_training(
 
         translated_images = _ddib_for_training(
             pipe,
-            source_images, # [bs, ch, 128, 128]
-            orig_class_labels, # [bs] --> [1, 1, 1, 1, 1, 1, ...]
+            source_images, # [bs, ch, H, W]
+            orig_class_labels, # [bs] e.g., [1, 1, 1, 1, 1, 1, ...]
             target_class_labels,
             num_inference_steps,
             process_idx=accelerator.process_index
@@ -530,7 +534,7 @@ def perform_class_transfer_for_paired_training(
         bce_loss_value, dice = None, None # Default
 
         if args.paired_training_loss.lower().strip() == "bce":
-            assert all(value in [-1, 1] for value in target_images.unique()), "target_images should be binary in {-1, 1}"
+            assert all(value in [-1, 1] for value in target_images.unique()), "target_images should be binary in {-1, 1}" # bce is only used for segmentation.
             target_images = make_tensor_binary(target_images) # Going from {-1, 1} to {0, 1}
             num_positive = (target_images == 1).sum().item()
             num_negative = (target_images == 0).sum().item()
@@ -671,7 +675,6 @@ def perform_sample_prediction_for_paired_training(
         target_classes = batch["target_class"].to(accelerator.device)
 
         noise: FloatTensor = torch.randn(source_images.shape).to(source_images.device)  # type: ignore
-
         
         timesteps: IntTensor = torch.randint(  # type: ignore
             0,
@@ -829,7 +832,7 @@ def _diffusion_and_backward(
             )  # use SNR weighting from distillation paper
             loss = loss.mean()
         case "v_prediction":
-            # Kian: our case.
+            # our default case.
             velocity = noise_scheduler.get_velocity(clean_images, noise, timesteps)
             loss = F.mse_loss(model_output, velocity)
         case _:
@@ -1759,7 +1762,7 @@ def evaluate_paired_dataset(
 class EpochTimer:
     def __init__(self):
         self.start_time = None
-        self.start_gs = None
+        self.start_gs = None # gs: global step
         self.end_time = None
         self.end_gs = None
 

@@ -221,6 +221,8 @@ def setup_dataset(
         )
     elif args.use_pytorch_loader:
         if args.denoiser_in_channels == 1:
+            # Calling ImageFolder with our loader defined above.
+            # This is for the case where the input images are single-channel.
             dataset: ImageFolder | Subset = ImageFolder(
                 root=Path(args.train_data_dir, args.split).as_posix(),
                 transform=lambda x: transformations(x),
@@ -279,8 +281,9 @@ def setup_dataset(
         transforms.ToTensor(),
         transforms.Normalize([0.5], [0.5]),  # map to [-1, 1] for SiLU
     ]
-    if args.data_aug_on_the_fly: # Kian: ture by default.
-        # Kian: There is a "no_data_aug_on_the_fly" arg in the arguments. We should put it in the args to disable augmentations.
+    if args.data_aug_on_the_fly: 
+        # It is ture by default.
+        # To disable data augmentation on the fly, a "--no-data-aug-on-the-fly" argument has been added to the arguments.
         list_transforms += [
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(),
@@ -319,13 +322,13 @@ def setup_paired_dataset(
         args,
         root=Path(args.test_data_dir).as_posix(), 
         source_class=args.source_class_for_paired_training,
-        transform=JointTransforms(args, h_flip_prob=0, v_flip_prob=0),
+        transform=JointTransforms(args, h_flip_prob=0, v_flip_prob=0), # No data augmentation for the test set.
         )
         return test_dataset
 
     paired_dataset: PairedSamplesDataset = PairedSamplesDataset(
         args,
-        root=Path(args.paired_train_data_dir, args.split).as_posix(), # Kian: args.split is "train" by default.
+        root=Path(args.paired_train_data_dir, args.split).as_posix(), # args.split is "train" by default.
         source_class=args.source_class_for_paired_training,
         transform=JointTransforms(args),
     )
@@ -347,12 +350,7 @@ def _select_subset_of_dataset(
         class_counts[label] += 1
 
     nb_classes = len(class_counts)
-
-    # print()
-    # print(f"list(class_counts.values()) --> {list(class_counts.values())}")
-    # print(f"[class_counts[0]] * nb_classes --> {[class_counts[0]] * nb_classes}")
-    # print()
-
+    
     assert (
         list(class_counts.values()) == [class_counts[0]] * nb_classes
     ), "The dataset is not balanced between classes"
